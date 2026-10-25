@@ -30,11 +30,14 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
 }
 
 [[nodiscard]] hipError_t MapRegisteredRegion(
-    const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination) {
+    const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination,
+    bool& source_was_read) {
+  source_was_read = false;
   void* host_copy =
       platform::CloneMappedWeightsToAnonymousPages(source.data, source.size);
   if (host_copy == nullptr)
     return hipErrorOutOfMemory;
+  source_was_read = true;
   const auto unmap = [&](void* pointer) {
     platform::ReleaseCommittedPages(pointer, source.size);
   };
@@ -60,7 +63,7 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
 }
 
 /// Device-resident placement: one hipMalloc copy in (on this APU target)
-/// carve-out memory, filled later by FillDeviceRegions.
+/// carve-out memory, filled from the cached mapping or by FillDeviceRegions.
 [[nodiscard]] hipError_t AllocateDeviceRegion(
     const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination) {
   void* device_data = nullptr;
@@ -159,14 +162,24 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
     auto& destination = weight_regions[i];
     hipError_t map_error;
     try {
-      map_error = MapRegisteredRegion(source, destination);
+      bool source_was_read = false;
+      map_error = MapRegisteredRegion(source, destination, source_was_read);
       if (map_error != hipSuccess) {
         // Mapped registration is the Linux fast path; the device-resident
         // upload preserves single-copy residency wherever it is refused.
         destination = {};
         map_error = AllocateDeviceRegion(source, destination);
-        if (map_error == hipSuccess)
-          device_regions.push_back(i);
+        if (map_error == hipSuccess) {
+          if (source_was_read) {
+            // A successful clone has already read the mapping. Reuse those
+            // cached bytes if registration fails instead of rereading the
+            // shard with direct I/O. When cloning is unavailable (Windows),
+            // keep the bounded file pipeline without touching the mapping.
+            map_error = CopyMappedRegion(source, destination.device_data);
+          } else {
+            device_regions.push_back(i);
+          }
+        }
       }
     } catch (const std::exception& e) {
       ReleaseWeightRegions(weight_regions);
@@ -174,7 +187,7 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
         *error_msg = e.what();
       return false;
     }
-    if (destination.device_data == nullptr) {
+    if (map_error != hipSuccess || destination.device_data == nullptr) {
       ReleaseWeightRegions(weight_regions);
       if (error_msg != nullptr) {
         *error_msg = "Failed to make GGUF shard " + std::to_string(i) +
