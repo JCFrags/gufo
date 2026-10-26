@@ -291,7 +291,7 @@ CI selection. Numerical and agent-replay obligations outside the selected suites
 remain separate; representative coverage is not all-model qualification.
 
 GitHub-hosted Linux runners build the candidate and main production packages
-with Nix, Cachix, the GitHub Nix cache and a shared C/C++/HIP compiler cache.
+with Nix, signed public binary caches, Cachix and a shared C/C++/HIP compiler cache.
 Both timing arms use the candidate's lock file. The binary artifact records the
 authorized revisions and archive checksums. The GPU runner installs Nix to
 restore those packages and their pinned runtime libraries; it never compiles.

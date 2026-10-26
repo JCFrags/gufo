@@ -197,12 +197,15 @@ jobs:
 
   smoke:
     name: Selected model checks on Strix Halo
-    needs: [ authorize, build ]
+    # Downloads overlap hosted compilation; consume the finalized artifact as
+    # soon as it exists rather than waiting for hosted cache-save post steps.
+    needs: authorize
     if: needs.authorize.outputs.has_work == 'true'
     runs-on: [ linux, strix-halo, devlab-dispatch ]
     timeout-minutes: 360
     permissions:
       contents: read
+      actions: read
     steps:
       # Self-hosted workspaces persist between runs; start from a clean tree.
       - name: Clean workspace and check disk space
@@ -379,6 +382,37 @@ jobs:
         with:
           name: gufo
           skipPush: true
+
+      - name: Wait for the hosted binary artifact
+        timeout-minutes: 120
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.api_url }}
+          ARTIFACT_NAME: linux-devlab-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          python3 - <<'PYWAIT'
+          import json, os, time
+          from urllib.request import Request, urlopen
+          root = f"{os.environ['API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          def get(suffix):
+              request = Request(root + suffix, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json'})
+              with urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          while True:
+              artifacts = get('/artifacts?name=' + os.environ['ARTIFACT_NAME'])['artifacts']
+              if any(item['name'] == os.environ['ARTIFACT_NAME'] for item in artifacts):
+                  print('Hosted binary artifact is ready', flush=True)
+                  break
+              jobs = get('/jobs')['jobs']
+              if any(job['name'].startswith('Hosted Linux binaries /') and
+                     job['conclusion'] in ('failure', 'cancelled', 'timed_out', 'skipped') for job in jobs):
+                  raise SystemExit('Hosted Linux build did not produce an artifact')
+              print('Waiting for hosted Linux binaries; model downloads continue', flush=True)
+              time.sleep(10)
+          PYWAIT
 
       - name: Download hosted Linux binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
