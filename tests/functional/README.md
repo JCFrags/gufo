@@ -290,12 +290,23 @@ Qwen27 Q8 remains an explicit manual functional qualification outside this bound
 CI selection. Numerical and agent-replay obligations outside the selected suites
 remain separate; representative coverage is not all-model qualification.
 
-An ephemeral GPU runner needs the documented native build dependencies, GPU
-access and enough temporary disk space for its selected checkpoints. It does not
-need mounted models or audio. `devlab_models.py` downloads only selected model
-assets and necessary drafts/projectors/evaluator weights from fixed Hugging Face
-revisions while both production binaries build. Optional `$GUFO_CI_CACHE`
-(default `$RUNNER_TOOL_CACHE/gufo`) reuse is an optimization, not a prerequisite.
+GitHub-hosted Linux runners build the candidate and main production packages
+with Nix, Cachix, the GitHub Nix cache and a shared C/C++/HIP compiler cache.
+Both timing arms use the candidate's lock file. The binary artifact records the
+authorized revisions and archive checksums. The GPU runner installs Nix to
+restore those packages and their pinned runtime libraries; it never compiles.
+Public runtime paths come from signed binary caches. An uncached runtime is
+included in the artifact, so fork PRs need no cache write credentials.
+
+An ephemeral GPU runner needs GPU access and enough disk space for its selected
+checkpoints. It does not need mounted models or audio. `devlab_models.py`
+downloads only selected assets and necessary drafts/projectors/evaluator weights
+from fixed Hugging Face revisions while the binary runtimes are restored.
+Linux and Windows inherit the runner's Hugging Face mirror and transfer settings.
+Model files and download metadata live under `$HF_HOME/gufo/models`, keyed by
+asset and revision, outside the disposable runner workspace. Without `HF_HOME`,
+the workflows use the user's standard `.cache/huggingface` directory. Cleanup
+preserves the models; logs report existing required files and download duration.
 The authorized controller checkout contains the English voice fixture. TTS uses
 the main Gufo binary and a pinned ASR checkpoint as its intelligibility
 evaluator. Missing downloads or fixtures fail visibly.

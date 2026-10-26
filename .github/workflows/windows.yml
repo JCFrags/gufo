@@ -586,6 +586,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # Inherit the runner's Hugging Face mirror, transfer settings and persistent cache.
+          $hfHome = if ($env:HF_HOME) { $env:HF_HOME } else { "$env:USERPROFILE\.cache\huggingface" }
+          $env:GUFO_MODEL_CACHE = Join-Path $hfHome 'gufo\models'
           python -m venv "$env:RUNNER_TEMP\hf-cli"
           if ($LASTEXITCODE -ne 0) { throw 'cannot create the Hugging Face venv' }
           & "$env:RUNNER_TEMP\hf-cli\Scripts\python.exe" -m pip install --quiet 'huggingface_hub[hf_xet]==1.26.0'
@@ -595,9 +597,12 @@ jobs:
           from pathlib import Path
           from huggingface_hub import snapshot_download
           registry = json.loads(Path("windows-gufo/tests/functional/devlab.json").read_text())
+          paths = {}
           for key in os.environ["GUFO_ASSETS"].split(","):
               asset = registry["assets"][key]
-              destination = Path(os.environ["RUNNER_TEMP"]) / "models" / key
+              destination = Path(os.environ["GUFO_MODEL_CACHE"]) / key / asset["revision"]
+              existing = sum((destination / name).is_file() for name in asset["required"])
+              print(f"{key}: {existing}/{len(asset['required'])} required files already present in {destination}", flush=True)
               started = time.monotonic()
               # Retried like devlab_models.py: the xet transfer can drop mid-file
               # and snapshot_download resumes what is already on disk.
@@ -617,6 +622,8 @@ jobs:
                       sys.exit(f"{key}: missing {name}")
               size = sum(p.stat().st_size for p in destination.rglob("*") if p.is_file())
               print(f"{key}: {size / 2**30:.2f} GiB in {seconds:.0f} s, {size / 2**20 / seconds:.1f} MiB/s", flush=True)
+              paths[key] = str(destination)
+          (Path(os.environ["RUNNER_TEMP"]) / "functional-assets.json").write_text(json.dumps(paths))
           '@
           $script | & "$env:RUNNER_TEMP\hf-cli\Scripts\python.exe" -
           if ($LASTEXITCODE -ne 0) { throw 'model download failed' }
@@ -624,14 +631,14 @@ jobs:
       - name: Run the per-family model smoke checks
         run: |
           $ErrorActionPreference = 'Stop'
-          $models = "$env:RUNNER_TEMP\models"
+          $assets = Get-Content "$env:RUNNER_TEMP\functional-assets.json" -Raw | ConvertFrom-Json
           $smoke = 'windows-gufo\tests\functional\family_smoke.py'
           $common = @('--binary', 'windows-gufo\gufo.exe', '--log-dir', "$env:RUNNER_TEMP\smoke-logs")
           $checks = [ordered]@{
-            embedding = @('embedding', '--model', "$models\embedding")
-            asr       = @('asr', '--model', "$models\asr")
-            tts       = @('tts', '--model', "$models\tts-base", '--asr-model', "$models\asr")
-            qwen27    = @('llm', '--model', "$models\qwen27\Qwen3.8-27B-UD-Q4_K_XL.gguf")
+            embedding = @('embedding', '--model', $assets.embedding)
+            asr       = @('asr', '--model', $assets.asr)
+            tts       = @('tts', '--model', $assets.'tts-base', '--asr-model', $assets.asr)
+            qwen27    = @('llm', '--model', (Join-Path $assets.qwen27 'Qwen3.8-27B-UD-Q4_K_XL.gguf'))
           }
           $failed = @()
           foreach ($name in $checks.Keys) {
@@ -641,7 +648,7 @@ jobs:
           }
           if ($failed) { throw "smoke checks failed: $($failed -join ', ')" }
 
-      - name: Remove the bundle and the weights
+      - name: Remove temporary bundle and environments
         if: always()
         run: |
-          Remove-Item -Recurse -Force windows-gufo, "$env:RUNNER_TEMP\models", "$env:RUNNER_TEMP\huggingface", "$env:RUNNER_TEMP\hf-cli", "$env:RUNNER_TEMP\smoke-logs" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force windows-gufo, "$env:RUNNER_TEMP\functional-assets.json", "$env:RUNNER_TEMP\hf-cli", "$env:RUNNER_TEMP\smoke-logs" -ErrorAction SilentlyContinue

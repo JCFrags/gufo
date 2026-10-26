@@ -471,7 +471,8 @@
       "paths": [
         "tests/functional/devlab*",
         "tests/functional/service_phases.py",
-        "tests/functional/requirements.txt"
+        "tests/functional/requirements.txt",
+        "tools/ci/linux_artifact.py"
       ],
       "owners": [
         "llm",
