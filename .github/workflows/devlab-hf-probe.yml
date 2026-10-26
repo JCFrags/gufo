@@ -1,0 +1,64 @@
+name: Devlab Hugging Face probe
+
+# Temporary: confirms Devlab downloads use the runner's in-rack Hugging Face
+# mirror and persistent cache (#807). Remove before merging.
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened, ready_for_review ]
+    paths:
+      - .github/workflows/devlab-hf-probe.yml
+      - tools/ci/devlab_hf_probe.py
+
+permissions: {}
+
+concurrency:
+  group: devlab-hf-probe-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Hugging Face route on ${{ matrix.os }}
+    # Same-repository PRs only: the runners are shared Devlab hardware.
+    if: >-
+      github.repository == 'gufo-org/gufo' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            python: python3
+            venv-python: hf-probe/bin/python
+          - os: windows
+            python: python
+            venv-python: hf-probe/Scripts/python.exe
+    runs-on: [ '${{ matrix.os }}', strix-halo, devlab-dispatch ]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            tools/ci
+            tests/functional/devlab.json
+          sparse-checkout-cone-mode: false
+
+      # Same huggingface_hub as the model download steps; no settings are
+      # overridden, so the probe sees exactly what those steps inherit.
+      - name: Install huggingface_hub
+        run: |
+          ${{ matrix.python }} -m venv hf-probe
+          ${{ matrix.venv-python }} -m pip install --quiet "huggingface_hub[hf_xet]==1.26.0"
+
+      - name: Probe endpoint, cache and throughput
+        run: ${{ matrix.venv-python }} tools/ci/devlab_hf_probe.py --output hf-probe-${{ matrix.os }}.json
+
+      - name: Retain probe results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hf-probe-${{ matrix.os }}
+          path: hf-probe-${{ matrix.os }}.json
