@@ -7,6 +7,10 @@ on:
     types: [ opened, synchronize, reopened, ready_for_review ]
   workflow_dispatch:
     inputs:
+      network_probe:
+        description: Only run bounded download-route probes on Linux and Windows
+        type: boolean
+        default: false
       pr_number:
         description: PR to test (head pinned at authorization)
         required: true
@@ -29,14 +33,70 @@ permissions: {}
 
 # A new push supersedes the PR's queued or running check.
 concurrency:
-  group: devlab-functional-${{ inputs.pr_number || github.event.pull_request.number }}
+  group: devlab-functional-${{ inputs.network_probe && 'network-probe' || inputs.pr_number || github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
+  probe-authorize:
+    if: github.repository == 'gufo-org/gufo' && github.event_name == 'workflow_dispatch' && inputs.network_probe
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Authorize runner access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_ACTOR: ${{ github.actor }}
+          RERUN_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          for actor in "$DISPATCH_ACTOR" "$RERUN_ACTOR"; do
+            role=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$actor/permission" --jq .role_name)
+            case "$role" in
+              admin|maintain) ;;
+              *) echo "::error::Runner probes require Maintain or Admin access"; exit 1 ;;
+            esac
+          done
+
+  network-probe:
+    needs: probe-authorize
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            python: python3
+            artifact: '12642831377'
+          - os: windows
+            python: python
+            artifact: '12642502810'
+    runs-on: [ '${{ matrix.os }}', strix-halo, devlab-dispatch ]
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/ci
+      - name: Probe both download sources and routes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          ${{ matrix.python }} tools/ci/devlab_network.py
+          --artifact ${{ matrix.artifact }}
+          --release https://github.com/gufo-org/gufo/releases/download/ci-devlab-40306072706-1/linux-artifacts.zip
+      - name: Retain route measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: network-probe-${{ matrix.os }}
+          path: network-probe.json
+
   authorize:
     name: Authorize functional checks
     if: >-
-      github.repository == 'gufo-org/gufo' &&
+      !inputs.network_probe && github.repository == 'gufo-org/gufo' &&
       (github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 5

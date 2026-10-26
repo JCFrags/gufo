@@ -151,13 +151,16 @@ def warp_proxy(directory):
     version = "4.2.1"
     archive = directory / "usque.zip"
     url = ("https://github.com/Diniboy1123/usque/releases/download/"
-           f"v{version}/usque_{version}_linux_amd64.zip")
+           f"v{version}/usque_{version}_{'windows' if os.name == 'nt' else 'linux'}_amd64.zip")
     subprocess.run(["curl", "--silent", "--show-error", "--fail", "--location",
                     "--max-time", "120", "--proto", "=https", "--proto-redir", "=https",
                     "--output", str(archive), url], check=True, timeout=130)
-    verify(archive, "sha256:4117e20695078af9c11edecd1a826c009bbc7ea0b7f64458612b4198910bc313")
-    executable = directory / "usque"
-    with zipfile.ZipFile(archive) as source, source.open("usque") as data, executable.open("wb") as output:
+    digest = ("f6f7f0a1a2bc9bcc15cf563ec1f892d00690a92c086b23ed3211b802209099e7"
+              if os.name == "nt" else
+              "4117e20695078af9c11edecd1a826c009bbc7ea0b7f64458612b4198910bc313")
+    verify(archive, "sha256:" + digest)
+    executable = directory / ("usque.exe" if os.name == "nt" else "usque")
+    with zipfile.ZipFile(archive) as source, source.open(executable.name) as data, executable.open("wb") as output:
         shutil.copyfileobj(data, output)
     executable.chmod(0o700)
     config = directory / "warp.json"
