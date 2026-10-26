@@ -212,7 +212,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf -- candidate baseline controller linux-artifacts functional-results functional-report functional-plan.json functional-assets.json phase-logs
+          rm -rf -- candidate baseline controller linux-artifacts linux-artifacts.tar.gz functional-results functional-report functional-plan.json functional-assets.json phase-logs
           # Model files and their local_dir metadata survive runner cleanup.
           cache_root="${HF_HOME:-$HOME/.cache/huggingface}/gufo"
           mkdir -p "$cache_root"
@@ -323,7 +323,7 @@ jobs:
             verification='KFD topology; ROCm tools are not installed'
           fi
           printf -- '- gfx1151: verified (%s)\n' "$verification" >> "$GITHUB_STEP_SUMMARY"
-          for tool in nix hipcc rocminfo rocm-smi amd-smi python3 git ccache; do
+          for tool in rocminfo rocm-smi amd-smi python3 git tar; do
             if command -v "$tool" >/dev/null 2>&1; then
               echo "$tool: available"
               printf -- '- %s: available\n' "$tool" >> "$GITHUB_STEP_SUMMARY"
@@ -342,13 +342,16 @@ jobs:
           ref: ${{ needs.authorize.outputs.merge }}
           persist-credentials: false
           path: controller
+          sparse-checkout: |
+            tests/functional
+            tools
 
       - name: Download authorized selection plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: functional-plan-${{ github.run_attempt }}
 
-      # Fetch assets while the pinned binary runtimes are restored. No mounted
+      # Fetch assets while the hosted binary bundle builds and downloads. No mounted
       # weights or voice fixtures are required; the controller includes English audio.
       - name: Start pinned selected-model downloads
         shell: bash
@@ -372,55 +375,16 @@ jobs:
           ) > "$RUNNER_TEMP/gufo-weights.log" 2>&1 < /dev/null &
           echo $! > "$RUNNER_TEMP/gufo-weights.pid"
 
-      - name: Install runtime store
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-        with:
-          determinate: false
-
-      - name: Enable runtime substitutions
-        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
-        with:
-          name: gufo
-          skipPush: true
-
-      - name: Wait for the hosted binary artifact
-        timeout-minutes: 120
+      - name: Download hosted Linux binaries through release CDN
+        timeout-minutes: 135
         env:
           GH_TOKEN: ${{ github.token }}
-          API_URL: ${{ github.api_url }}
-          ARTIFACT_NAME: linux-devlab-${{ github.run_attempt }}
         shell: bash
         run: |
-          python3 - <<'PYWAIT'
-          import json, os, time
-          from urllib.request import Request, urlopen
-          root = f"{os.environ['API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-          def get(suffix):
-              request = Request(root + suffix, headers={
-                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                  'Accept': 'application/vnd.github+json'})
-              with urlopen(request, timeout=60) as response:
-                  return json.load(response)
-          while True:
-              artifacts = get('/artifacts?name=' + os.environ['ARTIFACT_NAME'])['artifacts']
-              if any(item['name'] == os.environ['ARTIFACT_NAME'] for item in artifacts):
-                  print('Hosted binary artifact is ready', flush=True)
-                  break
-              jobs = get('/jobs')['jobs']
-              if any(job['name'].startswith('Hosted Linux binaries /') and
-                     job['conclusion'] in ('failure', 'cancelled', 'timed_out', 'skipped') for job in jobs):
-                  raise SystemExit('Hosted Linux build did not produce an artifact')
-              print('Waiting for hosted Linux binaries; model downloads continue', flush=True)
-              time.sleep(10)
-          PYWAIT
+          python3 controller/tools/ci/devlab_cdn.py download \
+            --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
-      - name: Download hosted Linux binaries
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: linux-devlab-${{ github.run_attempt }}
-          path: linux-artifacts
-
-      - name: Restore and diagnose pinned production binaries
+      - name: Unpack, verify and diagnose pinned production binaries
         id: binaries
         env:
           APPROVED_MERGE: ${{ needs.authorize.outputs.merge }}
@@ -428,12 +392,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 controller/tools/ci/linux_artifact.py restore \
+          tar -xzf linux-artifacts.tar.gz
+          python3 controller/tools/ci/linux_artifact.py verify \
             --source linux-artifacts/candidate --revision "$APPROVED_MERGE"
-          python3 controller/tools/ci/linux_artifact.py restore \
+          python3 controller/tools/ci/linux_artifact.py verify \
             --source linux-artifacts/baseline --revision "$APPROVED_BASE"
-          linux-artifacts/candidate/package/bin/gufo diagnose
-          linux-artifacts/baseline/package/bin/gufo diagnose
+          linux-artifacts/candidate/gufo diagnose
+          linux-artifacts/baseline/gufo diagnose
 
       - name: Wait for pinned selected-model weights
         id: weights
@@ -471,7 +436,7 @@ jobs:
         run: |
           "$RUNNER_TEMP/gufo-functional-client/bin/python" controller/tests/functional/devlab_run.py \
             --plan functional-plan.json --assets functional-assets.json \
-            --binary linux-artifacts/candidate/package/bin/gufo --base-binary linux-artifacts/baseline/package/bin/gufo \
+            --binary linux-artifacts/candidate/gufo --base-binary linux-artifacts/baseline/gufo \
             --output functional-results --report functional-report --logs phase-logs
 
       # Suite failures must not hide benchmark observations.
@@ -487,8 +452,8 @@ jobs:
           model_dir=$(python3 -c 'import json; print(json.load(open("functional-assets.json"))["flash-next"])')
           # Same runner and weights; main runs first.
           for revision in base head; do
-            binary=linux-artifacts/candidate/package/bin/gufo
-            [[ "$revision" == base ]] && binary=linux-artifacts/baseline/package/bin/gufo
+            binary=linux-artifacts/candidate/gufo
+            [[ "$revision" == base ]] && binary=linux-artifacts/baseline/gufo
             printf '\n### Benchmark: %s\n\n' "$revision" >> "$GITHUB_STEP_SUMMARY"
             "$binary" bench \
               --model "$model_dir/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf" \

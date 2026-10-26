@@ -32,7 +32,9 @@ jobs:
           persist-credentials: false
 
       - name: Validate artifact import contracts
-        run: python3 -m unittest discover -s tests/tools -p linux_artifact_test.py
+        run: |
+          python3 -m unittest discover -s tests/tools -p linux_artifact_test.py
+          python3 -m unittest discover -s tests/tools -p devlab_cdn_test.py
 
       - name: Checkout timing baseline
         if: inputs.baseline != ''
@@ -94,11 +96,24 @@ jobs:
           python3 tools/ci/linux_artifact.py pack --package result \
             --revision "$EXPECTED_REVISION" --output linux-artifacts/candidate
 
+      - name: Verify and archive the portable bundle
+        env:
+          EXPECTED_REVISION: ${{ inputs.revision }}
+          EXPECTED_BASELINE: ${{ inputs.baseline }}
+        run: |
+          set -euo pipefail
+          python3 tools/ci/linux_artifact.py verify --source linux-artifacts/candidate --revision "$EXPECTED_REVISION"
+          if [[ -n "$EXPECTED_BASELINE" ]]; then
+            python3 tools/ci/linux_artifact.py verify --source linux-artifacts/baseline --revision "$EXPECTED_BASELINE"
+          fi
+          tar -I 'gzip -1' -cf linux-artifacts.tar.gz linux-artifacts
+          du -h linux-artifacts.tar.gz
+
       - name: Upload production binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact-name }}
-          path: linux-artifacts/
+          path: linux-artifacts.tar.gz
           compression-level: 0
           retention-days: 3
           if-no-files-found: error

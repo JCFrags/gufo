@@ -293,15 +293,32 @@ remain separate; representative coverage is not all-model qualification.
 GitHub-hosted Linux runners build the candidate and main production packages
 with Nix, signed public binary caches, Cachix and a shared C/C++/HIP compiler cache.
 Both timing arms use the candidate's lock file. The binary artifact records the
-authorized revisions and archive checksums. The GPU runner installs Nix to
-restore those packages and their pinned runtime libraries; it never compiles.
-Public runtime paths come from signed binary caches. An uncached runtime is
-included in the artifact, so fork PRs need no cache write credentials.
+authorized revisions and executable checksums. A compressed portable bundle
+contains both executables, their pinned ELF loader, shared libraries and gfx1151
+BLAS kernel data. A trusted `devlab-cdn.yml` relay copies the opaque Actions artifact ZIP to a
+short-lived prerelease asset. Devlab downloads from GitHub's release CDN and
+checks the original Actions artifact SHA-256 before unpacking. It does not fetch
+the large bundle from Azure's Actions artifact store. A bounded range probe
+measures the CDN route. Below 5 MiB/s, the downloader also tests a rootless
+Cloudflare WARP MASQUE proxy (`usque` v4.2.1, checksum pinned) and uses it when
+it is faster. Only the bundle transfer uses the proxy; runner control and model
+mirror traffic keep their existing routes. Temporary WARP credentials and the
+loopback proxy are removed after the transfer. Transfer durations are logged
+separately from waiting for the relay. The relay uses only default
+branch code and never unpacks or executes the PR artifact. Daily cleanup deletes
+its `ci-devlab-<run>-<attempt>` releases and tags after three days. The relay
+workflow and `tools/ci/devlab_cdn.py` must be installed on the default branch
+before enabling the CDN consumer in PR workflows; `workflow_run` uses the default
+branch, so adding the relay only to a PR cannot activate it.
+The GPU runner unpacks and executes the verified bundle directly;
+it needs neither Nix nor administrator access and never compiles. Both binaries
+share one bundled runtime. Hosted jobs restore dependencies from signed binary
+caches; fork PRs need no cache write credentials.
 
 An ephemeral GPU runner needs GPU access and enough disk space for its selected
 checkpoints. It does not need mounted models or audio. `devlab_models.py`
 downloads only selected assets and necessary drafts/projectors/evaluator weights
-from fixed Hugging Face revisions while the binary runtimes are restored.
+from fixed Hugging Face revisions while the hosted bundle builds and downloads.
 Linux and Windows inherit the runner's Hugging Face mirror and transfer settings.
 Model files and download metadata live under `$HF_HOME/gufo/models`, keyed by
 asset and revision, outside the disposable runner workspace. Without `HF_HOME`,
