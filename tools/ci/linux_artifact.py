@@ -19,14 +19,22 @@ def output(*args):
 
 
 def cached_paths(cache, paths):
-    # Nix versions differ: missing paths can produce exit 1 with valid JSON.
-    result = subprocess.run(['nix', 'path-info', '--store', cache, '--json', *sorted(paths)],
-                            capture_output=True, text=True, check=False)
-    try:
-        info = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f'Cannot query {cache}: {result.stderr}') from error
-    return {path for path, value in info.items() if value is not None}
+    # Older Nix aborts a batch at its first missing path without emitting JSON;
+    # newer Nix includes null entries. Retry the remaining paths on old Nix.
+    pending = set(paths)
+    while pending:
+        result = subprocess.run(['nix', 'path-info', '--store', cache, '--json', *sorted(pending)],
+                                capture_output=True, text=True, check=False)
+        try:
+            info = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            absent = set(re.findall(r"path '(/nix/store/[^']+)' is not valid", result.stderr)) & pending
+            if not absent:
+                raise RuntimeError(f'Cannot query {cache}: {result.stderr}') from error
+            pending -= absent
+            continue
+        return {path for path, value in info.items() if value is not None}
+    return set()
 
 
 def pack(package, revision, destination):

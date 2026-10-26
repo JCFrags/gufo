@@ -18,6 +18,17 @@ SPEC.loader.exec_module(artifact)
 
 
 class ArtifactTest(unittest.TestCase):
+    def test_old_nix_aborts_without_json_at_first_cache_miss(self):
+        present = '/nix/store/cached-runtime'
+        absent = '/nix/store/missing-runtime'
+        responses = [subprocess.CompletedProcess([], 1, stdout='',
+                     stderr=f"error: path '{absent}' is not valid"),
+                     subprocess.CompletedProcess([], 0, stdout=json.dumps({
+                         present: {'narHash': 'sha256-example'}}), stderr='')]
+        with patch.object(artifact.subprocess, 'run', side_effect=responses) as run:
+            self.assertEqual(artifact.cached_paths('https://cache.example', {present, absent}), {present})
+            self.assertNotIn(absent, run.call_args.args[0])
+
     def test_cache_miss_exit_code_keeps_valid_partial_results(self):
         response = subprocess.CompletedProcess([], 1, stdout=json.dumps({
             '/nix/store/cached-runtime': {'narHash': 'sha256-example'},
