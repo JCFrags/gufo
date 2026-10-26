@@ -581,13 +581,11 @@ jobs:
           # One small model per family. Flash-Next (107 GiB) and DeepSeek V4
           # (81 GiB) are deferred.
           GUFO_ASSETS: embedding,asr,tts-base,qwen27
-          HF_HUB_DISABLE_XET: '0'
-          HF_XET_HIGH_PERFORMANCE: '1'
           HF_HUB_DOWNLOAD_TIMEOUT: '120'
           HF_HUB_ETAG_TIMEOUT: '60'
         run: |
           $ErrorActionPreference = 'Stop'
-          $env:HF_HOME = "$env:RUNNER_TEMP\huggingface"
+          # Inherit the runner's Hugging Face mirror, transfer settings and persistent cache.
           python -m venv "$env:RUNNER_TEMP\hf-cli"
           if ($LASTEXITCODE -ne 0) { throw 'cannot create the Hugging Face venv' }
           & "$env:RUNNER_TEMP\hf-cli\Scripts\python.exe" -m pip install --quiet 'huggingface_hub[hf_xet]==1.26.0'
