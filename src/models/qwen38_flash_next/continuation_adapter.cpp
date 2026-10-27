@@ -29,9 +29,50 @@ bool Draft(ContinuationPart part) {
          part == ContinuationPart::kDraftRawKeys ||
          part == ContinuationPart::kDraftResidual;
 }
+bool OrdinaryKv(ContinuationPart part) {
+  return part == ContinuationPart::kKey || part == ContinuationPart::kValue ||
+         part == ContinuationPart::kDraftKey ||
+         part == ContinuationPart::kDraftValue;
+}
 bool Pool(ContinuationPart part) {
   return part == ContinuationPart::kPooledKeys ||
          part == ContinuationPart::kDraftPooledKeys;
+}
+void ValidatePackedRows(std::span<const std::byte> bytes,
+                        std::uint32_t elements, std::size_t row,
+                        KvCacheType type) {
+  if (bytes.empty())
+    return;
+  hipPointerAttribute_t attributes{};
+  const auto status = hipPointerGetAttributes(&attributes, bytes.data());
+  if (status != hipSuccess) {
+    if (status != hipErrorInvalidValue)
+      Check(status);
+    // Ordinary pageable host backing is not registered with HIP.
+    (void)hipGetLastError();
+  }
+  const bool device =
+      status == hipSuccess && (attributes.type == hipMemoryTypeDevice ||
+                               attributes.type == hipMemoryTypeManaged);
+  const auto validate = [&](std::span<const std::byte> input) {
+    for (std::size_t offset = 0; offset < input.size(); offset += row)
+      ValidateKvRow(input.subspan(offset, row), elements, type);
+  };
+  if (!device) {
+    validate(bytes);
+    return;
+  }
+  // BorrowRowsView may name device-only allocation. Validate immutable native
+  // bytes through bounded packed staging, never by dereferencing GPU pointers.
+  const auto capacity =
+      std::min(bytes.size(), std::max(row, (65536 / row) * row));
+  std::vector<std::byte> staging(capacity);
+  for (std::size_t offset = 0; offset < bytes.size(); offset += capacity) {
+    const auto size = std::min(capacity, bytes.size() - offset);
+    Check(hipMemcpy(staging.data(), bytes.data() + offset, size,
+                    hipMemcpyDefault));
+    validate(std::span<const std::byte>(staging).first(size));
+  }
 }
 struct Metadata {
   std::uint32_t version{2};
@@ -211,7 +252,8 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
       context_(context),
       layout_(model_ ? model_->config() : Config{},
               mode == core::SessionMode::kSpeculative, context,
-              model_ ? model_->executor_->max_speculative() : 0),
+              model_ ? model_->executor_->max_speculative() : 0,
+              model_ ? model_->CacheType() : KvCacheType::kF16),
       identity_(std::move(identity)) {
   if ((mode != core::SessionMode::kAutoregressive &&
        mode != core::SessionMode::kSpeculative) ||
@@ -222,13 +264,18 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
     for (unsigned i = 0; i < 4; ++i)
       identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(2);  // Private components attest the target checkpoint boundary.
-  put(Session::kSnapshotPayloadVersion);
+  put(3);  // Explicit storage/numerics ABI; private state attests target depth.
+  put(ExpectedKvPayloadVersion(model_->CacheType()));
   put(context);
   put(mode == core::SessionMode::kSpeculative);
   put(model_->executor_->max_speculative());
   put(model_->PrefillCapacity());
   put(model_->DecodeConcurrency());
+  const auto numeric_identity =
+      KvCacheCompatibilityIdentity(model_->CacheType());
+  put(static_cast<std::uint32_t>(numeric_identity.size()));
+  identity_.insert(identity_.end(), numeric_identity.begin(),
+                   numeric_identity.end());
   for (const auto& component : layout_.Components())
     descriptors_.push_back(component.descriptor);
 }
@@ -740,6 +787,12 @@ cache::Completion ContinuationAdapter::CopyRowsIn(
     if (!row || first > end || end > state.expected[id.value - 1].valid_rows ||
         bytes.size() != (end - first) * row)
       throw std::invalid_argument("invalid Flash-Next row restore");
+    if (KvUsesQ8Codec(model_->CacheType()) && OrdinaryKv(component.part)) {
+      // Validate the canonical packed payload; restoration never re-encodes it.
+      // Check every row before submitting any device copy for this piece.
+      ValidatePackedRows(bytes, model_->config().AttentionKvDim(), row,
+                         model_->CacheType());
+    }
     auto* destination =
         bytes.empty()
             ? nullptr

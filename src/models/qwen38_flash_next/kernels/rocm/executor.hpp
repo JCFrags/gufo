@@ -107,6 +107,9 @@ public:
 
   [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
+  [[nodiscard]] KvCacheType kv_cache_type() const noexcept {
+    return kv_cache_type_;
+  }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
   }
@@ -152,8 +155,8 @@ private:
   };
   struct AttentionState {
     const qwen::vision::DeviceRope* rope{nullptr};
-    __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
-    __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
+    void* k_cache{nullptr};    ///< [max_context][KvRowBytes(kv_heads*d,type)]
+    void* v_cache{nullptr};    ///< canonical packed rows; never a F16 shadow
     float* index_k{nullptr};   ///< [index_capacity_][indexer_dim] raw ring
     __half* block_k{nullptr};  ///< [max_context/ratio][indexer_dim]
   };
@@ -167,8 +170,8 @@ private:
     std::uint32_t mtp_blocks;    ///< complete predictor indexer blocks
   };
   struct MtpState {
-    __half* k_cache{nullptr};
-    __half* v_cache{nullptr};
+    void* k_cache{nullptr};
+    void* v_cache{nullptr};
     float* index_k{nullptr};
     __half* block_k{nullptr};
     std::uint32_t blocks{0};
@@ -187,6 +190,7 @@ private:
   const Executor* owner_{nullptr};
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
+  KvCacheType kv_cache_type_{KvCacheType::kF16};
   bool mtp_enabled_{false};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
@@ -247,6 +251,7 @@ public:
     /// Largest session context. Zero selects the native context; values
     /// above it require YaRN (Config::MaxContextLength()).
     std::uint32_t max_context{0};
+    KvCacheType kv_cache_type{KvCacheType::kF16};
   };
 
   ~Executor();
@@ -389,6 +394,7 @@ public:
   struct SnapshotInfo {
     std::uint32_t position{0};
     std::uint32_t hidden_rows{0};
+    bool mutation_started{false};
   };
   [[nodiscard]] std::uint64_t SnapshotBytes(const Session& session,
                                             std::uint32_t hidden_rows) const;
@@ -531,6 +537,14 @@ private:
                        bool projections_ready = false,
                        bool project_output = true,
                        GdnCheckpoint checkpoint = {}) const;
+  /// Separate cache-only projections: K RMS/RoPE, optional K/V rotation,
+  /// then canonical StoreKv. Full Attention owns its own rotations.
+  /// Keep the caller's existing YaRN policy explicit at this boundary.
+  bool ProduceCacheOnlyKv(const DeviceLayer& l, float* key, float* value,
+                          void* key_cache, void* value_cache,
+                          std::uint32_t rows, const std::uint32_t* position,
+                          const qwen::vision::DeviceRope* rope, YarnRope yarn,
+                          std::string* error_msg) const;
   /// `pos`/`first_block` are device values; `start_pos` and `pool_grid`
   /// are their host-side counterparts for the eager-only decisions.
   bool Attention(const DeviceLayer& l, Session::AttentionState& s,
@@ -740,6 +754,12 @@ private:
   YarnRope yarn_{};
   /// Bounded score scratch, shared by sequential selector chunks.
   std::size_t select_score_floats_{0};
+  /// One layer's full-prefix view, shared sequentially on stream_. Owned by
+  /// allocations_; never session/checkpoint state or a cross-call cache.
+  /// Sized for configured context; larger supported sessions use packed KV.
+  std::uint32_t q8_prefill_capacity_{0};
+  void* q8_prefill_k_f16_{nullptr};
+  void* q8_prefill_v_f16_{nullptr};
   std::vector<void*> allocations_;
   /// Coherent pinned storage, read directly by the GPU through s_.ple_emb.
   /// Reused only after the preceding forward has drained its stream.

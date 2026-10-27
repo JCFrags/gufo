@@ -3,9 +3,15 @@
 add_library(gufo_qwen38_flash_next STATIC
   config.cpp
   continuation_layout.cpp
+  kv_cache.cpp
   ngram.cpp
   rope_scaling.cpp
   weights.cpp)
+
+target_sources(gufo_qwen38_flash_next PRIVATE kv_rotation.cpp)
+# The CPU oracle has explicit F32 operation boundaries and strict zero signs.
+set_source_files_properties(kv_rotation.cpp PROPERTIES
+  COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-frounding-math;-Werror=switch")
 
 target_include_directories(gufo_qwen38_flash_next PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(gufo_qwen38_flash_next PUBLIC gufo_core Threads::Threads)
@@ -52,6 +58,7 @@ if (ENGINE_ENABLE_HIP)
   set(QFN_HIP_SOURCES
     continuation_adapter.cpp
     ${QFN_ROCM_DIR}/kernels.hip.cpp
+    ${QFN_ROCM_DIR}/kv_q8_dequant.hip
     ${QFN_ROCM_DIR}/w8a8_wave64.hip
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
@@ -59,6 +66,7 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/batch.cpp
     engine.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
+
   set_source_files_properties(${QFN_ROCM_DIR}/kernels.hip.cpp PROPERTIES LANGUAGE HIP)
   set_source_files_properties(${QFN_ROCM_DIR}/w8a8_wave64.hip
     PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")

@@ -17,7 +17,9 @@
 
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/qfn_kv_ingress_validation.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/support/temporary_directory.hpp"
 
@@ -1215,6 +1217,552 @@ void FragmentedBackingKeepsCompletePrompt() {
   const TextRunnerToken next = 99;
   runner->adapter->Append(restored_state.slot, {&next, 1}, {&next, 1});
 }
+// Invocation-order fixture only: real q8 semantic faults use the real QFN
+// runner test. This sentinel proves startup calls the existing model-owned
+// finish before exposing a matching durable checkpoint, not on later restore.
+void RotatedDiskAdmissionFinishesBeforePublication() {
+  class AdmissionRunner final : public Runner {
+  public:
+    bool rotated{true};
+    bool refuse{};
+    mutable std::atomic<unsigned> checked{};
+    TextRunnerDescriptor Descriptor() const override {
+      auto d = Runner::Descriptor();
+      if (rotated) {
+        d.state_abi = "qwen38-flash-next-rocm-session-v1";
+        d.persistence = TextRunnerPersistenceDescriptor{
+            {3, 2, 3}, models::qwen38_flash_next::kKvRotatedNumericsEpoch};
+      }
+      return d;
+    }
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto r = Runner::CreateComponentCacheResources(ledger, ram);
+      auto allocate = std::move(r->allocate);
+      r->allocate = [this,
+                     allocate = std::move(allocate)](const auto& request) {
+        auto b = allocate(request);
+        if (request.category != cache::ResourceCategory::kPrivateState) {
+          auto finish = std::move(b.finish);
+          b.finish = [this, finish = std::move(finish)]() mutable {
+            ++checked;
+            if (refuse)
+              throw std::invalid_argument("fixture packed semantic rejection");
+            return finish();
+          };
+        }
+        return b;
+      };
+      return r;
+    }
+  };
+  const TemporaryDirectory temp("gufo-rotated-disk-admission-order");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20};
+  const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
+  const auto publish = [&] {
+    auto runner = std::make_shared<AdmissionRunner>();
+    TextRunnerPool pool(runner, 1, disk);
+    auto request = pool.Acquire(prompt);
+    Prefill(request);
+    (void)Generate(request);
+    assert(request.Commit().disk_queued_bytes > 0);
+  };
+  publish();
+  {
+    auto runner = std::make_shared<AdmissionRunner>();
+    runner->refuse = true;
+    TextRunnerPool pool(runner, 1, disk);
+    // No restore or execution before checking that startup invoked the hook.
+    assert(runner->checked.load() > 0);
+    auto request = pool.Acquire(prompt);
+    assert(!request.cache_hit());
+    request.Invalidate();
+  }
+  publish();  // Valid replacement in the same root after malformed retirement.
+  {
+    auto runner = std::make_shared<AdmissionRunner>();
+    TextRunnerPool pool(runner, 1, disk);
+    assert(runner->checked.load() > 0);
+    auto request = pool.Acquire(prompt);
+    assert(request.cache_disk_hit());
+    request.Invalidate();
+  }
+  {
+    auto runner = std::make_shared<AdmissionRunner>();
+    runner->rotated = false;
+    runner->refuse = true;
+    TextRunnerPool pool(runner, 1, disk);
+    assert(runner->checked.load() == 0);  // Legacy startup fast path unchanged.
+  }
+}
+
+// CPU admission fixture: real QFN layout/codec, finish wrapper, CRC-valid
+// disk store and serving publication. No model state is
+// executed/restored: private bytes are placeholders, not a native checkpoint.
+namespace packed_ingress_cpu {
+namespace qfn = models::qwen38_flash_next;
+constexpr std::uint32_t kContext = 256, kElements = 512;
+constexpr std::size_t kRam = 4ULL << 20;
+constexpr auto kPlain = qfn::KvCacheType::kQ8_0;
+qfn::Config Geometry() {
+  qfn::Config c;
+  c.num_layers = 48;
+  c.full_attention_interval = 4;
+  c.context_length = kContext;
+  c.hidden_size = 8;
+  c.hc_count = 1;
+  c.vocab_size = 32;
+  c.num_kv_heads = 2;
+  c.num_heads = 24;
+  c.head_dim = 256;
+  c.rotary_dim = 64;
+  c.indexer_head_dim = 8;
+  c.indexer_top_k = 16;
+  c.compress_ratio = 4;
+  c.ssm_conv_kernel = 2;
+  c.ssm_head_dim = 4;
+  c.ssm_num_k_heads = c.ssm_num_v_heads = 1;
+  c.ple_layer = 1;
+  c.ple_ngram_size = 3;
+  c.ple_conv_kernel = 4;
+  return c;
+}
+bool Packed(qfn::ContinuationPart part) {
+  return part == qfn::ContinuationPart::kKey ||
+         part == qfn::ContinuationPart::kValue ||
+         part == qfn::ContinuationPart::kDraftKey ||
+         part == qfn::ContinuationPart::kDraftValue;
+}
+cache::CompatibilityDigest Digest(std::span<const std::uint8_t> bytes) {
+  crypto::Sha256Hasher hash;
+  hash.Update(bytes);
+  return hash.Finish();
+}
+cache::Identity Identity(qfn::KvCacheType type) {
+  const auto text =
+      "cpu-admission-only;" + qfn::KvCacheCompatibilityIdentity(type);
+  return {text.begin(), text.end()};
+}
+// Startup admission uses only registered descriptors. A slot/transfer call is
+// a test error, not a simulated native restore.
+class LayoutAdapter final : public cache::Adapter {
+  std::vector<cache::ComponentDescriptor> descriptors_;
+  cache::Identity identity_;
+  [[noreturn]] static void Unexpected() {
+    throw std::logic_error(
+        "CPU ingress fixture must not execute/restore a slot");
+  }
+
+public:
+  explicit LayoutAdapter(qfn::KvCacheType type) : identity_(Identity(type)) {
+    const qfn::ContinuationLayout layout(Geometry(), true, kContext, 1, type);
+    for (const auto& c : layout.Components())
+      descriptors_.push_back(c.descriptor);
+  }
+  cache::Capabilities GetCapabilities() const override { return {true, true}; }
+  std::span<const cache::ComponentDescriptor> Components() const override {
+    return descriptors_;
+  }
+  cache::Identity CompatibilityIdentity() const override { return identity_; }
+  std::unique_ptr<cache::Slot> CreateSlot(cache::MutationGuard&) override {
+    Unexpected();
+  }
+  std::vector<cache::ComponentPosition> Positions(
+      const cache::Slot&) const override {
+    Unexpected();
+  }
+  std::vector<cache::Rows> PlanPrefill(const cache::Slot&, cache::Rows,
+                                       cache::Rows) const override {
+    Unexpected();
+  }
+  void BeginRestore(cache::Slot&,
+                    std::span<const cache::ComponentPosition>) override {
+    Unexpected();
+  }
+  cache::Completion CapturePrivate(const cache::Slot&, cache::ComponentId,
+                                   std::span<std::byte>,
+                                   cache::Stream&) override {
+    Unexpected();
+  }
+  cache::Completion CopyRowsOut(const cache::Slot&, cache::ComponentId,
+                                cache::Rows, cache::Rows, std::span<std::byte>,
+                                cache::Stream&) override {
+    Unexpected();
+  }
+  cache::Completion CopyRowsIn(cache::Slot&, cache::ComponentId, cache::Rows,
+                               cache::Rows, std::span<const std::byte>,
+                               cache::Stream&) override {
+    Unexpected();
+  }
+  cache::Completion LoadPrivate(cache::Slot&, cache::ComponentId,
+                                std::span<const std::byte>,
+                                cache::Stream&) override {
+    Unexpected();
+  }
+  bool Validate(cache::Slot&,
+                std::span<const cache::ComponentPosition>) override {
+    Unexpected();
+  }
+  bool Invalidate(cache::Slot&) noexcept override { std::terminate(); }
+};
+class AdmissionRunner final : public Runner {
+public:
+  qfn::KvCacheType type;
+  bool fingerprint{true}, foreign_abi{};
+  bool fail_resource{}, fail_operational{};
+  mutable cache::ResourceLedger* ledger{};
+  mutable std::size_t allocations{}, finishes{};
+  explicit AdmissionRunner(qfn::KvCacheType type) : type(type) {}
+  std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view) const override {
+    return {10, 11};
+  }
+  TextRunnerDescriptor Descriptor() const override {
+    auto d = Runner::Descriptor();
+    d.max_context = kContext;
+    d.state_abi = foreign_abi ? "foreign-session-v1"
+                              : "qwen38-flash-next-rocm-session-v1";
+    if (fingerprint) {
+      d.persistence = TextRunnerPersistenceDescriptor{
+          Identity(type), qfn::ExpectedKvPayloadVersion(type)};
+    }
+    return d;
+  }
+  std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger& ledger, std::size_t) const override {
+    this->ledger = &ledger;
+    auto r = std::make_unique<ComponentCacheResources>();
+    r->adapter = std::make_unique<LayoutAdapter>(type);
+    r->owner = std::make_shared<int>(1);
+    r->stream = [] { return std::make_unique<FakeStream>(); };
+    r->staging = [](std::size_t size) {
+      auto data = std::make_shared<std::vector<std::uint8_t>>(size);
+      return cache::StagingAllocation{data, *data};
+    };
+    r->allocate = [this, &ledger](const cache::PayloadRequest& request) {
+      ++allocations;
+      if (fail_resource)
+        throw cache::ResourceExhausted{};
+      if (fail_operational)
+        throw std::runtime_error("admission allocation failed");
+      assert(request.bytes && request.bytes < kRam);
+      struct Backing {
+        cache::ResourceCharge pool;
+        std::vector<std::byte> bytes;
+      };
+      auto backing = std::make_shared<Backing>(Backing{
+          ledger.Reserve(cache::ResourceCategory::kBackingFree, request.bytes)
+              .Convert(),
+          std::vector<std::byte>(request.bytes)});
+      auto reservation = std::make_shared<cache::ResourceReservation>(
+          backing->pool.ReserveBacking(request.category));
+      auto owner = std::shared_ptr<const void>(backing, backing->bytes.data());
+      return ComponentCaptureBuffer{backing->bytes,
+                                    [this, reservation, owner] {
+                                      ++finishes;
+                                      return cache::Payload::Committed(
+                                          reservation->Convert(), owner);
+                                    },
+                                    nullptr,
+                                    {}};
+    };
+    detail::InstallQfnPackedKvIngressValidation(*r, Geometry(), true, kContext,
+                                                type);
+    return r;
+  }
+};
+struct Artifact {
+  struct Header {
+    cache::Identity identity;
+    cache::DiskManifest manifest;
+  } header;
+  std::vector<std::vector<std::uint8_t>> images;
+  std::array<std::size_t, 4> kv_images{};
+};
+Artifact Canonical(qfn::KvCacheType type) {
+  Artifact a;
+  auto& h = a.header;
+  h.identity = Identity(type);
+  h.manifest.checkpoint = {1000};
+  h.manifest.lineage = {1000};
+  h.manifest.tokens = {10, 11};
+  h.manifest.compatibility = Digest(h.identity);
+  const qfn::ContinuationLayout layout(Geometry(), true, kContext, 1, type);
+  const auto positions = layout.Positions(2, 2, 0, 0);
+  std::array<bool, 4> found{};
+  for (std::size_t i = 0; i < layout.Components().size(); ++i) {
+    const auto& c = layout.Components()[i];
+    const auto& d = c.descriptor;
+    cache::DiskComponent component{.descriptor = d, .position = positions[i]};
+    const auto bytes =
+        d.row_bytes ? positions[i].valid_rows * d.row_bytes : d.state_bytes;
+    if (bytes) {
+      const auto image = a.images.size();
+      a.images.emplace_back(bytes);
+      if (Packed(c.part)) {
+        std::vector<float> values(kElements);
+        values[0] = 127;
+        values[1] = 0.5F;
+        values[2] = -0.5F;
+        values[32] = 1e-7F;
+        for (std::size_t off = 0; off < bytes; off += d.row_bytes)
+          qfn::EncodeKvRow(values, type,
+                           std::as_writable_bytes(std::span(a.images.back()))
+                               .subspan(off, d.row_bytes));
+        const auto part = c.part == qfn::ContinuationPart::kKey        ? 0U
+                          : c.part == qfn::ContinuationPart::kValue    ? 1U
+                          : c.part == qfn::ContinuationPart::kDraftKey ? 2U
+                                                                       : 3U;
+        if (!found[part]) {
+          a.kv_images[part] = image;
+          found[part] = true;
+        }
+      }
+      cache::DiskFileId id{};
+      id[0] = static_cast<std::uint8_t>(image + 1);
+      const cache::DiskPayload payload{id, bytes,
+                                       cache::DiskChecksum(a.images.back())};
+      if (d.row_bytes)
+        component.tail = payload;
+      else
+        component.private_state = payload;
+    }
+    h.manifest.components.push_back(std::move(component));
+  }
+  assert(std::ranges::all_of(found, [](bool b) { return b; }));
+  return a;
+}
+void Poison(Artifact& a, unsigned part, unsigned fault) {
+  auto& image = a.images[a.kv_images.at(part)];
+  auto block = std::span(image).last(sizeof(qfn::KvBlockQ8_0));
+  if (fault == 0) {
+    block[offsetof(qfn::KvBlockQ8_0, values)] = 0x80;
+  } else {
+    const auto scale =
+        std::array<std::uint16_t, 5>{0xbc00, 0x8000, 0x7c00, 0x7e00, 0x7bff}.at(
+            fault - 1);
+    block[0] = scale & 255;
+    block[1] = scale >> 8;
+    std::fill(block.begin() + 2, block.end(), 0);
+    if (fault == 5)
+      block[2] = 127;
+  }
+  // Both real codecs accept the metadata; the bytes' CRC is correct even
+  // though their last block (in row two) is semantically inadmissible.
+  std::size_t next = 0;
+  for (auto& c : a.header.manifest.components) {
+    if (c.tail)
+      c.tail->checksum = cache::DiskChecksum(a.images[next++]);
+    if (c.private_state)
+      c.private_state->checksum = cache::DiskChecksum(a.images[next++]);
+  }
+  (void)cache::DecodeManifest(cache::EncodeManifest(a.header.manifest));
+}
+void Publish(const std::filesystem::path& root, const Artifact& a,
+             std::uint8_t manifest_id = 255) {
+  cache::ResourceLedger ledger({kRam, kRam, 0, 0});
+  cache::DiskStore disk(ledger, root, kRam);
+  std::vector<cache::DiskWriteBuffer> buffers;
+  std::size_t next = 0;
+  for (const auto& c : a.header.manifest.components) {
+    if (c.tail)
+      buffers.push_back({true, c.tail->file, a.images[next++]});
+    if (c.private_state)
+      buffers.push_back({true, c.private_state->file, a.images[next++]});
+  }
+  assert(next == a.images.size());
+  cache::DiskFileId manifest{};
+  manifest[0] = manifest_id;
+  disk.Publish(manifest, a.header.manifest, buffers);
+}
+std::size_t Admit(const std::filesystem::path& root, const Artifact& artifact,
+                  const std::shared_ptr<AdmissionRunner>& runner) {
+  ComponentTextCache restarted(
+      runner, 0, kRam,
+      TextRunnerDiskCacheOptions{.directory = root, .capacity_bytes = kRam});
+  // Query the admitted index before any slot restore can hide a missing
+  // startup check.
+  return restarted.CachedPrefixTokens(artifact.header.manifest.tokens, nullptr);
+}
+void RotatedWithoutFingerprintDisk() {
+  const auto type = qfn::KvCacheType::kQ8_0Rotated;
+  auto bad = Canonical(type);
+  Poison(bad, 0, 0);
+  const TemporaryDirectory temp("gufo-rotated-process-local-disk");
+  Publish(temp.path(), bad);
+  auto runner = std::make_shared<AdmissionRunner>(type);
+  runner->fingerprint = false;
+  assert(Admit(temp.path(), bad, runner) == 0);
+  assert(runner->allocations > 0);
+}
+void CorruptedDisk() {
+  for (auto type : {kPlain, qfn::KvCacheType::kQ8_0Rotated}) {
+    for (bool fingerprint : {true, false}) {
+      const TemporaryDirectory temp("gufo-packed-corrupt-disk");
+      const auto bad = Canonical(type);
+      auto dependent = bad;
+      dependent.header.manifest.checkpoint = {2000};
+      dependent.header.manifest.lineage = {2000};
+      dependent.header.manifest.tokens = {20, 21};
+      auto good = bad;
+      good.header.manifest.checkpoint = {3000};
+      good.header.manifest.lineage = {3000};
+      good.header.manifest.tokens = {30, 31};
+      for (auto& c : good.header.manifest.components) {
+        for (auto& p : c.chunks)
+          p.file[1] = 1;
+        for (auto* p : {&c.tail, &c.private_state})
+          if (*p)
+            (*p)->file[1] = 1;
+      }
+      Publish(temp.path(), bad);
+      Publish(temp.path(), dependent, 254);  // Shares the corrupt dependency.
+      Publish(temp.path(), good, 253);
+      cache::DiskFileId file{};
+      file[0] = static_cast<std::uint8_t>(bad.kv_images[0] + 1);
+      const auto path =
+          temp.path() / "v2" / "private" / cache::DiskFileName(file);
+      const auto bytes = std::filesystem::file_size(path);
+      {
+        std::fstream payload(path,
+                             std::ios::in | std::ios::out | std::ios::binary);
+        payload.seekg(offsetof(qfn::KvBlockQ8_0, values));
+        char value{};
+        assert(payload.read(&value, 1));
+        value ^= 1;
+        payload.seekp(offsetof(qfn::KvBlockQ8_0, values));
+        assert(payload.write(&value, 1));
+      }
+      assert(std::filesystem::file_size(path) == bytes);
+      {
+        // Metadata recovery accepts the unchanged manifests and payload sizes.
+        // Only the serving startup's payload read can detect this corruption.
+        cache::ResourceLedger ledger({kRam, kRam, 0, 0});
+        cache::DiskStore disk(ledger, temp.path(), kRam);
+        assert(disk.Entries().size() == 3);
+        for (const auto* artifact :
+             std::array<const Artifact*, 3>{&bad, &dependent, &good}) {
+          auto description =
+              disk.Describe(artifact->header.manifest.checkpoint);
+          assert(description);
+          assert(cache::EncodeManifest(description->Manifest()) ==
+                 cache::EncodeManifest(artifact->header.manifest));
+        }
+      }
+      for (unsigned restart = 0; restart < 2; ++restart) {
+        auto runner = std::make_shared<AdmissionRunner>(type);
+        runner->fingerprint = fingerprint;
+        ComponentTextCache restarted(
+            runner, 0, kRam,
+            TextRunnerDiskCacheOptions{.directory = temp.path(),
+                                       .capacity_bytes = kRam});
+        assert(restarted.CachedPrefixTokens(bad.header.manifest.tokens,
+                                            nullptr) == 0);
+        assert(restarted.CachedPrefixTokens(dependent.header.manifest.tokens,
+                                            nullptr) == 0);
+        assert(restarted.CachedPrefixTokens(good.header.manifest.tokens,
+                                            nullptr) == 2);
+        assert(runner->finishes > 0);
+      }
+      cache::ResourceLedger ledger({kRam, kRam, 0, 0});
+      cache::DiskStore disk(ledger, temp.path(), kRam);
+      assert(disk.Entries().size() == 1);
+      assert(disk.Describe(good.header.manifest.checkpoint));
+    }
+  }
+}
+void AdmissionFailuresPreserveDisk() {
+  const auto valid = Canonical(kPlain);
+  for (bool resource : {true, false}) {
+    const TemporaryDirectory temp("gufo-packed-admission-failure");
+    Publish(temp.path(), valid);
+    auto runner = std::make_shared<AdmissionRunner>(kPlain);
+    runner->fail_resource = resource;
+    runner->fail_operational = !resource;
+    bool failed{};
+    try {
+      (void)Admit(temp.path(), valid, runner);
+    } catch (const cache::ResourceExhausted&) {
+      assert(resource);
+      failed = true;
+    } catch (const std::runtime_error& error) {
+      assert(!resource);
+      assert(std::string_view(error.what()) == "admission allocation failed");
+      failed = true;
+    }
+    assert(failed);
+    runner = std::make_shared<AdmissionRunner>(kPlain);
+    assert(Admit(temp.path(), valid, runner) == 2);
+  }
+}
+void MalformedDisk() {
+  const std::array types{kPlain, qfn::KvCacheType::kQ8_0Rotated};
+  for (auto type : types) {
+    for (bool fingerprint : {true, false}) {
+      const auto valid = Canonical(type);
+      for (unsigned part = 0; part < 4; ++part) {
+        for (unsigned fault = 0; fault < 6; ++fault) {
+          auto bad = valid;
+          Poison(bad, part, fault);
+          const TemporaryDirectory temp("gufo-packed-semantic-disk");
+          Publish(temp.path(), bad);  // Valid manifest and CRC, invalid codec.
+          auto runner = std::make_shared<AdmissionRunner>(type);
+          runner->fingerprint = fingerprint;
+          assert(Admit(temp.path(), bad, runner) == 0);
+          assert(runner->allocations > 0);
+          // A malformed publication was retired, not deferred until restore.
+          {
+            cache::ResourceLedger ledger({kRam, kRam, 0, 0});
+            cache::DiskStore disk(ledger, temp.path(), kRam);
+            assert(disk.Entries().empty());
+          }
+          Publish(temp.path(), valid);  // Same-root repair/retry.
+          runner = std::make_shared<AdmissionRunner>(type);
+          runner->fingerprint = fingerprint;
+          assert(Admit(temp.path(), valid, runner) == 2);
+          assert(runner->finishes > 0);
+        }
+      }
+    }
+    const auto valid = Canonical(type);
+    for (std::size_t i = 0; i < valid.header.manifest.components.size(); ++i) {
+      if (valid.header.manifest.components[i].descriptor.kind !=
+          cache::ComponentKind::kAppendRows)
+        continue;
+      auto mismatch = valid;
+      ++mismatch.header.manifest.components[i].descriptor.layout_version;
+      const TemporaryDirectory temp("gufo-packed-layout-mismatch");
+      Publish(temp.path(), mismatch);
+      auto runner = std::make_shared<AdmissionRunner>(type);
+      runner->fingerprint = false;
+      assert(Admit(temp.path(), mismatch, runner) == 0);
+    }
+    for (bool fingerprint : {true, false}) {
+      const TemporaryDirectory temp("gufo-packed-foreign-abi");
+      auto bad = valid;
+      Poison(bad, 0, 0);
+      Publish(temp.path(), bad);
+      auto runner = std::make_shared<AdmissionRunner>(type);
+      runner->foreign_abi = true;
+      runner->fingerprint = fingerprint;
+      assert(Admit(temp.path(), bad, runner) == 2);
+      assert(runner->allocations == 0);
+    }
+  }
+  for (bool fingerprint : {true, false}) {
+    const TemporaryDirectory temp("gufo-f16-no-packed-admission");
+    auto f16 = Canonical(qfn::KvCacheType::kF16);
+    Poison(f16, 0, 3);  // Never restore these nonfinite F16 controls.
+    Publish(temp.path(), f16);
+    auto runner = std::make_shared<AdmissionRunner>(qfn::KvCacheType::kF16);
+    runner->fingerprint = fingerprint;
+    assert(Admit(temp.path(), f16, runner) == 2);
+    assert(runner->allocations == 0);
+  }
+}
+}  // namespace packed_ingress_cpu
+
 void DiskBudgetEvictsAnUnpinnedConversation() {
   const TemporaryDirectory temp("gufo-component-budget-test");
   const std::filesystem::path directory = temp.path();
@@ -1875,6 +2423,19 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
 }
 }  // namespace
 int main() {
+  if (std::getenv("GUFO_TEST_ROTATED_PROCESS_LOCAL_ONLY") != nullptr) {
+    packed_ingress_cpu::RotatedWithoutFingerprintDisk();
+    std::cout << "CPU fingerprint-absent rotated disk admission PASS; native "
+                 "NOT RUN\n";
+    return 0;
+  }
+  if (std::getenv("GUFO_TEST_PACKED_INGRESS_ONLY") != nullptr) {
+    packed_ingress_cpu::CorruptedDisk();
+    packed_ingress_cpu::AdmissionFailuresPreserveDisk();
+    packed_ingress_cpu::MalformedDisk();
+    std::cout << "CPU packed disk admission PASS\n";
+    return 0;
+  }
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
   SharedPeerReusesTheCurrentStableCapture();
@@ -1902,6 +2463,9 @@ int main() {
   BackingPressureKeepsSharedPrefix();
   BackingPressureKeepsSharedPrefix(true);
   FragmentedBackingKeepsCompletePrompt();
+  RotatedDiskAdmissionFinishesBeforePublication();
+  packed_ingress_cpu::CorruptedDisk();
+  packed_ingress_cpu::AdmissionFailuresPreserveDisk();
   DiskBudgetEvictsAnUnpinnedConversation();
   LoweredDiskBudgetEvictsOldestAtStartup();
   OrphansLeaveBeforeCheckpoints();

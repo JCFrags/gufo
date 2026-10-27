@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/kv_cache_options.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/embedding_service.hpp"
@@ -605,9 +606,12 @@ void PrintServeHelp(std::string_view program_name,
     bool enable_yarn = false;
     std::string trace_path;
 
+    models::qwen38_flash_next::KvCacheType kv_cache_type =
+        models::qwen38_flash_next::KvCacheType::kF16;
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
+    RegisterKvCacheTypeOption(parser, &kv_cache_type);
 
     // Model & Context
     parser.AddOption("-m", "--model", "PATH",
@@ -1221,9 +1225,12 @@ int RunServe(std::span<const char* const> args) {
     bool enable_yarn = false;
     std::string trace_path;
 
+    models::qwen38_flash_next::KvCacheType kv_cache_type =
+        models::qwen38_flash_next::KvCacheType::kF16;
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
+    RegisterKvCacheTypeOption(llm_parser, &kv_cache_type);
     llm_parser.AddOption("-m", "--model", "PATH",
                          "Path to GGUF model file (required)", "Model", &model);
     llm_parser.AddOption(
@@ -1522,7 +1529,7 @@ int RunServe(std::span<const char* const> args) {
         },
         vision_model_path,
         server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes},
-        enable_yarn);
+        enable_yarn, kv_cache_type);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

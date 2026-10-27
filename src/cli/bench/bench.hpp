@@ -10,12 +10,15 @@
 #include <vector>
 
 #include "src/core/sampling.hpp"
+#include "src/models/qwen38_flash_next/kv_cache.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 namespace gufo::cli {
 
 struct BenchOptions {
   std::string model_path;
+  models::qwen38_flash_next::KvCacheType kv_cache_type =
+      models::qwen38_flash_next::KvCacheType::kF16;
   std::vector<std::size_t> n_prompts{2048};
   std::vector<std::size_t> n_gens{128};
   std::vector<std::size_t> n_depths{0};

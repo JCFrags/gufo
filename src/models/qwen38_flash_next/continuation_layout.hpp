@@ -3,10 +3,12 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "src/cache/types.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/kv_cache.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -47,10 +49,16 @@ struct ContinuationBackingClass {
   std::size_t block_bytes{}, blocks{}, metadata_bytes{};
 };
 
+// Canonical storage and arithmetic ABI, shared by serving and adapter
+// identities. Bump the numerical epoch whenever reconstruction/attention
+// arithmetic changes.
+[[nodiscard]] std::string KvCacheCompatibilityIdentity(KvCacheType);
+
 class ContinuationLayout {
 public:
   ContinuationLayout(const Config&, bool mtp, std::uint32_t context,
-                     std::uint32_t kept_rows);
+                     std::uint32_t kept_rows,
+                     KvCacheType type = KvCacheType::kF16);
   [[nodiscard]] std::span<const ContinuationComponent> Components() const {
     return components_;
   }

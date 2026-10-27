@@ -2,6 +2,7 @@
 
 import os
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -78,7 +79,40 @@ def main():
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
     assert "--enable-yarn" in help_text
+    assert "--kv-cache-type" in help_text
+    assert "q8_0-rotated" in help_text
+    assert "experimental and lossy" in help_text
+    types = ("f16", "q8_0", "q8_0-rotated")
+    type_error = "--kv-cache-type must be f16, q8_0 or q8_0-rotated"
+    for value in types:
+        check(["serve", "llm", "--kv-cache-type", value, "--model",
+               "missing.gguf"], 1, "Error loading model 'missing.gguf'")
+    invalid_types = ("", "q8", "Q8_0", "bf16", "q4_0", "q8_0_rotated", "q8_0-plain")
+    for value in invalid_types:
+        check(["serve", "llm", "--kv-cache-type", value], 2, type_error)
+    for command in ("prompt", "chat", "bench"):
+        check([command, "--help"], 0, "--kv-cache-type")
+        check([command, "--kv-cache-type", "q4_0"], 2, type_error)
     assert "it applies to every request" in help_text
+    # Architecture-only GGUF fixtures prove unsupported families fail before
+    # tokenizer/weight/device loading, including in a CPU-only CLI build.
+    with tempfile.TemporaryDirectory() as directory:
+        def gguf_string(value):
+            data = value.encode()
+            return struct.pack("<Q", len(data)) + data
+
+        for architecture in ("qwen2", "qwen3", "qwen3next", "deepseek4", "qwen4exp"):
+            path = os.path.join(directory, architecture + ".gguf")
+            data = (struct.pack("<4sIQQ", b"GGUF", 3, 0, 1)
+                    + gguf_string("general.architecture")
+                    + struct.pack("<I", 8) + gguf_string(architecture))
+            with open(path, "wb") as fixture:
+                fixture.write(data + b"\0" * (-len(data) % 32))
+            if architecture != "qwen4exp":
+                for command in ("prompt", "chat", "bench"):
+                    for value in types[1:]:
+                        check([command, "--model", path, "--kv-cache-type", value],
+                              1, "requires Qwen3.8-Flash-Next")
     # The flag is a plain switch: it must not swallow the next argument.
     check(["serve", "llm", "--enable-yarn", "--model", "missing.gguf"], 1,
           "Error loading model 'missing.gguf'")

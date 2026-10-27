@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/kv_cache_options.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
@@ -81,6 +82,7 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
   parser.AddOption("-m", "--model", "PATH",
                    "Path to GGUF model file (required)", "Model",
                    &opt.model_path);
+  RegisterKvCacheTypeOption(parser, &opt.kv_cache_type);
 
   parser.AddCustomOption(
       "-p", "--n-prompt", "n,n,...",
@@ -941,6 +943,7 @@ int RunQwen38FlashNextBenchmark(
           .mtp_model_path = mtp ? options.mtp_model_path : "",
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
           .rope_scaling = rope_scaling,
+          .kv_cache_type = options.kv_cache_type,
       },
       &error);
   if (model == nullptr) {
@@ -1306,6 +1309,13 @@ int RunBench(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (!ValidateKvCacheTypeForArchitecture(
+          opt.kv_cache_type,
+          reader->GetMetadataString("general.architecture").value_or(""),
+          &err)) {
+    std::cerr << "Error: " << err << '\n';
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (opt.enable_yarn && !IsQwen38FlashNext(*reader)) {

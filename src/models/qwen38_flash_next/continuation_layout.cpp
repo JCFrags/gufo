@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
@@ -17,11 +18,83 @@ bool IsPool(ContinuationPart part) {
   return part == ContinuationPart::kPooledKeys ||
          part == ContinuationPart::kDraftPooledKeys;
 }
+std::uint32_t KvComponentLayoutVersion(KvCacheType type) {
+  switch (type) {
+    case KvCacheType::kF16:
+      return 1;
+    case KvCacheType::kQ8_0:
+      return 2;
+    case KvCacheType::kQ8_0Rotated:
+      return 3;
+  }
+  throw std::invalid_argument("unsupported Flash-Next KV cache type");
+}
 }  // namespace
+
+std::string KvCacheCompatibilityIdentity(KvCacheType type) {
+  // Bind the attention implementation and packed reconstruction
+  // path independently of other builds. Equal row widths are not an ABI.
+  std::string identity = "ordinary_kv_dtype=";
+  identity += KvCacheTypeName(type);
+  identity += "\nordinary_kv_scope=all-trunk-and-mtp\n";
+  switch (type) {
+    case KvCacheType::kF16:
+      identity +=
+          "ordinary_kv_layout=row-major-f16-le-v1\n"
+          "ordinary_kv_block_elements=1\n"
+          "ordinary_kv_scale_dtype=none\n"
+          "ordinary_kv_rounding_saturation_revision=f16-rne-v1\n"
+          "ordinary_kv_reconstruction=f16-identity-v1\n";
+      break;
+    case KvCacheType::kQ8_0:
+    case KvCacheType::kQ8_0Rotated:
+      identity +=
+          "ordinary_kv_layout=ggml-q8_0-f16le-scale-then-i8x32-v1\n"
+          "ordinary_kv_block_elements=32\n"
+          "ordinary_kv_scale_dtype=f16\n"
+          "ordinary_kv_rounding_saturation_revision="
+          "f32-absmax-div127-roundf-away-clamp127-scale-f16-rne-v1\n"
+          "ordinary_kv_reconstruction=f16-rne-of-f32-scale-times-i8-v1\n"
+          "ordinary_kv_gpu_reconstruction_equality=ieee-values-zero-sign-"
+          "equivalent-v1\n"
+          "ordinary_kv_zero_or_f32_scale_underflow=scale0-codes0\n"
+          "ordinary_kv_f16_scale_underflow=preserve-codes-value-zero-v1\n";
+      break;
+    default:
+      throw std::invalid_argument("unsupported Flash-Next KV cache type");
+  }
+  if (KvIsRotated(type)) {
+    identity +=
+        "ordinary_kv_basis=hadamard-rotated-v1\n"
+        "ordinary_kv_key_query_transform=h256-per-head\n"
+        "ordinary_kv_value_output_transform=4-contiguous-h64-per-head\n"
+        "ordinary_kv_transform_order=natural-sylvester-no-signs-no-"
+        "permutation\n"
+        "ordinary_kv_normalization=first-f32-rne-h256-1/16-h64-1/8\n"
+        "ordinary_kv_butterfly=ascending-distance-f32-rne-low-u+v-high-u-v-v1\n"
+        "ordinary_kv_transform_placement=post-rms-post-rope-pre-store\n"
+        "ordinary_kv_output_inverse=after-complete-attention-before-sigmoid-"
+        "gate\n"
+        "ordinary_kv_indexer_transform=none\n"
+        "ordinary_kv_gpu_transform_equality=nonzero-bit-exact-zero-sign-"
+        "equivalent\n";
+  }
+  identity +=
+      "ordinary_kv_key_insertion=post-f32-rope\n"
+      "ordinary_kv_value_insertion=f32-projection\n"
+      "indexer_pool_dtype=f16\n"
+      "indexer_query_raw_dtype=f32\n"
+      "gdn_state_dtype=f32\n";
+  const auto epoch = std::to_string(ExpectedKvPayloadVersion(type));
+  identity += "numerical_kernel_epoch=" + epoch +
+              "\nnumerical_build_lane=rocm-qfn-q8-wmma-v" + epoch + "\n";
+  return identity;
+}
 
 ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
                                        std::uint32_t context,
-                                       std::uint32_t kept_rows)
+                                       std::uint32_t kept_rows,
+                                       KvCacheType type)
     : context_(context), ratio_(c.compress_ratio), mtp_(mtp) {
   if (!context || context > c.MaxContextLength() || !ratio_ ||
       !c.full_attention_interval || !c.num_layers || !c.AttentionKvDim() ||
@@ -29,12 +102,18 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
       !c.ssm_head_dim || !c.ssm_num_v_heads || !c.HcDim() || !c.vocab_size ||
       (mtp && !kept_rows))
     throw std::invalid_argument("invalid Flash-Next continuation geometry");
+  if (KvIsRotated(type) && (c.head_dim != 256 || c.rotary_dim != 64 ||
+                            c.num_heads != 24 || c.num_kv_heads != 2))
+    throw std::invalid_argument(
+        "rotated Flash-Next KV requires D256/R64/24Q/2KV");
+  const auto kv_row_bytes = KvRowBytes(c.AttentionKvDim(), type);
   raw_capacity_ = std::min(context, std::max(c.indexer_top_k, ratio_ - 1));
   const auto add = [&](ContinuationPart part, std::size_t row,
-                       std::size_t state, std::uint32_t layer = 0) {
+                       std::size_t state, std::uint32_t layer = 0,
+                       std::uint32_t version = 1) {
     const auto id = static_cast<std::uint32_t>(components_.size() + 1);
     components_.push_back({{{id},
-                            1,
+                            version,
                             row ? cache::ComponentKind::kAppendRows
                                 : cache::ComponentKind::kPrivateState,
                             row,
@@ -57,10 +136,10 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
               sizeof(float),
           layer);
     } else {
-      add(ContinuationPart::kKey, std::size_t{c.AttentionKvDim()} * 2, 0,
-          layer);
-      add(ContinuationPart::kValue, std::size_t{c.AttentionKvDim()} * 2, 0,
-          layer);
+      add(ContinuationPart::kKey, kv_row_bytes, 0, layer,
+          KvComponentLayoutVersion(type));
+      add(ContinuationPart::kValue, kv_row_bytes, 0, layer,
+          KvComponentLayoutVersion(type));
       add(ContinuationPart::kPooledKeys, std::size_t{c.indexer_head_dim} * 2, 0,
           layer);
       add(ContinuationPart::kRawKeys, 0,
@@ -72,8 +151,10 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
     add(ContinuationPart::kPleHistory, 0,
         std::size_t{c.PleConvHistory()} * c.HcDim() * sizeof(float));
   if (mtp) {
-    add(ContinuationPart::kDraftKey, std::size_t{c.AttentionKvDim()} * 2, 0);
-    add(ContinuationPart::kDraftValue, std::size_t{c.AttentionKvDim()} * 2, 0);
+    add(ContinuationPart::kDraftKey, kv_row_bytes, 0, 0,
+        KvComponentLayoutVersion(type));
+    add(ContinuationPart::kDraftValue, kv_row_bytes, 0, 0,
+        KvComponentLayoutVersion(type));
     add(ContinuationPart::kDraftPooledKeys, std::size_t{c.indexer_head_dim} * 2,
         0);
     add(ContinuationPart::kDraftRawKeys, 0,

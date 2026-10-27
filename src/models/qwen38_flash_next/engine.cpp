@@ -53,10 +53,12 @@ struct SessionSnapshotHeader {
   MtpLengthState draft_policy;
   std::uint32_t image_identity_bytes;
   std::uint32_t policy_concurrency;
-  std::uint32_t reserved{0};
+  KvCacheType kv_cache_type;
   speculative::PromptLookup<>::State lookup;
 };
 static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
+static_assert(offsetof(SessionSnapshotHeader, kv_cache_type) ==
+              32 + sizeof(MtpLengthState) + 8);
 
 std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
                                        std::uint32_t vocab_size,
@@ -74,6 +76,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                    const ModelOptions& options,
                                    std::string* error_msg) {
   std::shared_ptr<Model> m(new Model());
+  if (!IsKnownKvCacheType(options.kv_cache_type)) {
+    AssignError(error_msg, "unsupported Flash-Next KV cache type");
+    return nullptr;
+  }
   if (options.decode_concurrency == 0 || options.decode_concurrency > 8) {
     AssignError(error_msg, "decode concurrency must be between one and eight");
     return nullptr;
@@ -106,6 +112,16 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     m->weights_->config.rope_scaling = *options.rope_scaling;
   }
   const Config& c = m->weights_->config;
+  if (KvIsRotated(options.kv_cache_type) &&
+      (c.head_dim != 256 || c.rotary_dim != 64 || c.num_heads != 24 ||
+       c.num_kv_heads != 2)) {
+    AssignError(error_msg, "rotated Flash-Next KV requires D256/R64/24Q/2KV");
+    return nullptr;
+  }
+  if (!IsValidKvRow(c.AttentionKvDim(), options.kv_cache_type)) {
+    AssignError(error_msg, "invalid Flash-Next KV cache row geometry");
+    return nullptr;
+  }
   if (options.max_context == 0 || options.max_context > c.MaxContextLength()) {
     AssignError(error_msg, "context exceeds the model's " +
                                std::to_string(c.MaxContextLength()) +
@@ -176,6 +192,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   exec.max_context = options.max_context;
+  exec.kv_cache_type = options.kv_cache_type;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -446,7 +463,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
   std::uint8_t* out = snapshot->data_.get();
   const SessionSnapshotHeader header{
       .magic = kSessionSnapshotMagic,
-      .version = kSnapshotPayloadVersion,
+      .version = ExpectedKvPayloadVersion(model_->CacheType()),
       .vocab_size = model_->VocabSize(),
       .token_count = token_count,
       .hidden_rows = hidden_rows,
@@ -454,6 +471,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
       .draft_policy = draft_length_.State(),
       .image_identity_bytes = static_cast<std::uint32_t>(identity.size()),
       .policy_concurrency = model_->DecodeConcurrency(),
+      .kv_cache_type = model_->CacheType(),
       .lookup = lookup_.Save(),
   };
   std::memcpy(out, &header, sizeof(header));
@@ -510,8 +528,13 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   }
   std::memcpy(&header, payload.data(), sizeof(header));
   if (header.magic != kSessionSnapshotMagic ||
-      header.version != kSnapshotPayloadVersion) {
-    AssignError(error_msg, "session snapshot format is not supported");
+      !IsCompatibleSnapshotPayload(header.version, header.kv_cache_type,
+                                   model_->CacheType())) {
+    AssignError(error_msg, header.magic == kSessionSnapshotMagic &&
+                                   header.version == ExpectedKvPayloadVersion(
+                                                         model_->CacheType())
+                               ? "session snapshot KV cache type does not match"
+                               : "session snapshot format is not supported");
     return false;
   }
   if (header.vocab_size != model_->VocabSize() || header.token_count == 0 ||
@@ -551,9 +574,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   std::memcpy(logits.data(), in, logits.size() * sizeof(float));
   in += logits.size() * sizeof(float);
 
-  if (image_identity.empty())
-    ConfigureVision(nullptr);
-  valid_ = false;
+  // Native restoration rebuilds/clears vision only after validating its bytes.
   rocm::Executor::SnapshotInfo info;
   const auto remaining = ContextSize() - header.token_count;
   auto next_drafts = MtpEnabled()
@@ -567,20 +588,36 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
                            restored_policy.Choose(remaining ? remaining - 1 : 0,
                                                   header.token_count, 0, true));
   }
-  if (!model_->executor_->RestoreSnapshot(
-          *session_,
-          std::span<const std::uint8_t>(
-              in, static_cast<std::size_t>(header.executor_bytes)),
-          &info, error_msg, next_drafts, deferred)) {
-    Reset();
+  bool restored = false;
+  try {
+    restored = model_->executor_->RestoreSnapshot(
+        *session_,
+        std::span<const std::uint8_t>(
+            in, static_cast<std::size_t>(header.executor_bytes)),
+        &info, error_msg, next_drafts, deferred);
+  } catch (...) {
+    // Preserve preflight failures, but never expose old logits/history over
+    // partially restored native state if a transfer/allocation throws.
+    if (info.mutation_started)
+      valid_ = false;
+    throw;
+  }
+  if (!restored) {
+    // Geometry/packed-byte preflight rejection must leave the live session
+    // untouched. A transfer failure after writes begin still invalidates it.
+    if (info.mutation_started)
+      Reset();
     return false;
   }
+  valid_ = false;
   if (info.position != header.token_count ||
       info.hidden_rows != header.hidden_rows) {
     Reset();
     AssignError(error_msg, "session snapshot positions are inconsistent");
     return false;
   }
+  if (image_identity.empty())
+    image_prompt_.reset();
   tokens_ = std::move(tokens);
   ForgetDraftVocab();
   lookup_.Restore(header.lookup);

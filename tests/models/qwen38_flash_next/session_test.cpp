@@ -1906,6 +1906,21 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
 }
 
 int main(int argc, char** argv) {
+  auto cache_type = qfn::KvCacheType::kF16;
+  if (argc >= 3 && std::string_view(argv[argc - 2]) == "--kv-cache-type") {
+    const std::string_view value(argv[argc - 1]);
+    if (value == "q8_0")
+      cache_type = qfn::KvCacheType::kQ8_0;
+    else if (value == "q8_0-rotated")
+      cache_type = qfn::KvCacheType::kQ8_0Rotated;
+    else if (value != "f16") {
+      std::cerr << "--kv-cache-type requires f16 or q8_0"
+                   " or q8_0-rotated"
+                   "\n";
+      return 2;
+    }
+    argc -= 2;
+  }
   const bool lookup_only =
       argc == 6 && std::string_view(argv[5]) == "--lookup-only";
   const bool execution_only =
@@ -1927,7 +1942,10 @@ int main(int argc, char** argv) {
     std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
                  "[--batch-only | --prefill-only | --sampling-only | "
                  "--cache-only | --eos-only | --lookup-only | "
-                 "--execution-only TOKENS]\n";
+                 "--execution-only TOKENS] "
+                 "[--kv-cache-type f16|q8_0"
+                 "|q8_0-rotated"
+                 "]\n";
     return 77;
   }
   if (execution_only) {
@@ -1947,7 +1965,8 @@ int main(int argc, char** argv) {
         {.max_context = execution_only ? execution_tokens + 16 : 6145,
          .mtp_model_path = argv[4],
          .max_draft_tokens = 7,
-         .decode_concurrency = 8},
+         .decode_concurrency = 8,
+         .kv_cache_type = cache_type},
         &error);
     Require(model != nullptr, error);
     if (lookup_only) {
@@ -2002,7 +2021,8 @@ int main(int argc, char** argv) {
                                {.max_context = 6145,
                                 .mtp_model_path = argv[4],
                                 .max_draft_tokens = 7,
-                                .decode_concurrency = decode_concurrency},
+                                .decode_concurrency = decode_concurrency,
+                                .kv_cache_type = cache_type},
                                &error);
       Require(model != nullptr, error);
     };
@@ -2175,7 +2195,8 @@ int main(int argc, char** argv) {
                              {.max_context = 6145,
                               .mtp_model_path = argv[4],
                               .max_draft_tokens = 7,
-                              .decode_concurrency = 8},
+                              .decode_concurrency = 8,
+                              .kv_cache_type = cache_type},
                              &error);
     Require(model != nullptr, error);
     std::reverse(replays.begin(), replays.end());

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/kv_cache_options.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
@@ -89,6 +90,7 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
   RegisterImageOptions(parser, opt);
+  RegisterKvCacheTypeOption(parser, &opt.kv_cache_type);
 
   // Prompt & Formatting
   if (command == "prompt") {
@@ -670,7 +672,8 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
        .mtp_model_path =
            opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
        .max_draft_tokens = opt.draft_tokens,
-       .vision_model_path = opt.vision_model_path},
+       .vision_model_path = opt.vision_model_path,
+       .kv_cache_type = opt.kv_cache_type},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
@@ -855,6 +858,15 @@ static std::optional<PromptOptions> ParseTextOptions(
   if (parser.IsHelpRequested()) {
     return std::nullopt;
   }
+  if (opt.force_cpu &&
+      opt.kv_cache_type != models::qwen38_flash_next::KvCacheType::kF16) {
+    if (error_msg)
+      *error_msg = "--kv-cache-type " +
+                   std::string(models::qwen38_flash_next::KvCacheTypeName(
+                       opt.kv_cache_type)) +
+                   " requires the ROCm backend";
+    return std::nullopt;
+  }
   opt.sampling_supplied = SamplingOptionsSupplied(parser);
   try {
     opt.sampling.Validate();
@@ -1004,6 +1016,13 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (!ValidateKvCacheTypeForArchitecture(
+          opt.kv_cache_type,
+          reader->GetMetadataString("general.architecture").value_or(""),
+          &err)) {
+    std::cerr << "Error: " << err << '\n';
+    return 1;
+  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1227,6 +1246,13 @@ int RunChat(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (!ValidateKvCacheTypeForArchitecture(
+          opt.kv_cache_type,
+          reader->GetMetadataString("general.architecture").value_or(""),
+          &err)) {
+    std::cerr << "Error: " << err << '\n';
+    return 1;
+  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)

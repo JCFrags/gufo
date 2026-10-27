@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -22,6 +23,8 @@
 #include "src/core/platform/pages.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kv_producer.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kv_q8_prefill_view.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -763,6 +766,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   auto& view = *checkpoint->state;
   view.owner_ = this;
   view.max_context_ = source.max_context_;
+  view.kv_cache_type_ = source.kv_cache_type_;
   view.index_capacity_ = source.index_capacity_;
   view.position_ = source.position_ + prefix;
   view.mtp_enabled_ = source.mtp_enabled_;
@@ -967,6 +971,19 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     return nullptr;
   }
   const Config& c = model.config();
+  if (!IsKnownKvCacheType(options.kv_cache_type) ||
+      (KvIsRotated(options.kv_cache_type) &&
+       (c.head_dim != 256 || c.rotary_dim != 64 || c.num_heads != 24 ||
+        c.num_kv_heads != 2))) {
+    AssignError(error_msg, "unsupported rotated Flash-Next KV geometry");
+    return nullptr;
+  }
+  if (!IsValidKvRow(c.AttentionKvDim(), options.kv_cache_type) ||
+      (options.kv_cache_type == KvCacheType::kQ8_0 && c.head_dim % 32 != 0)) {
+    AssignError(error_msg,
+                "invalid Flash-Next KV cache type or block geometry");
+    return nullptr;
+  }
   if (options.max_context > c.MaxContextLength()) {
     AssignError(error_msg, "executor context exceeds the model context");
     return nullptr;
@@ -1000,6 +1017,32 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   const std::size_t hidden = c.hidden_size;
   const std::size_t slots = T * c.num_experts_used;
   auto& a = e->allocations_;
+  const auto view_limit = WmmaCausalAttentionContextLimit(
+      c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio);
+  if (options.kv_cache_type == KvCacheType::kQ8_0 && T >= 256 &&
+      MatrixRows(T) && view_limit != 0) {
+    e->q8_prefill_capacity_ = detail::Q8PrefillViewCapacity(
+        options.max_context, e->context_capacity_, view_limit);
+    const std::size_t rows = e->q8_prefill_capacity_;
+    const std::size_t width = c.AttentionKvDim();
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    if (rows == 0 || width == 0 || rows > max_size / width ||
+        rows * width > max_size / (2 * sizeof(__half))) {
+      AssignError(error_msg, "q8 prefill F16 view size overflow");
+      return nullptr;
+    }
+    // Eager shared scratch: 2 * configured capacity * KV width * sizeof(half),
+    // 390.625 MiB at 200000 x 512. No reduction of session context support.
+    // Not SessionBytes or DeferredScratchBytes: admission
+    // samples free device memory after these allocations, like other scratch.
+    const std::size_t count = rows * width;
+    e->q8_prefill_k_f16_ = Alloc<__half>(a, count, error_msg);
+    if (e->q8_prefill_k_f16_ == nullptr)
+      return nullptr;
+    e->q8_prefill_v_f16_ = Alloc<__half>(a, count, error_msg);
+    if (e->q8_prefill_v_f16_ == nullptr)
+      return nullptr;
+  }
   Scratch& s = e->s_;
   auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
@@ -1270,6 +1313,7 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     return nullptr;
   }
   s->max_context_ = max_context;
+  s->kv_cache_type_ = options_.kv_cache_type;
   // Before sparse attention starts, pooling can lag by indexer_top_k
   // rows. Afterwards only an incomplete block precedes the current batch.
   // Completed block keys remain in block_k; their raw rows are dead.
@@ -1277,7 +1321,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
   auto& a = s->allocations_;
-  const std::size_t kv_row = c.AttentionKvDim();
+  const std::size_t kv_row =
+      KvRowBytes(c.AttentionKvDim(), options_.kv_cache_type);
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
@@ -1291,11 +1336,11 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     } else {
       auto& at = s->attention_[il];
       at.k_cache =
-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                        error_msg, &s->allocated_bytes_);
+          Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * kv_row,
+                              error_msg, &s->allocated_bytes_);
       at.v_cache =
-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                        error_msg, &s->allocated_bytes_);
+          Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * kv_row,
+                              error_msg, &s->allocated_bytes_);
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
@@ -1317,11 +1362,11 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
     s->mtp_.k_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                      error_msg, &s->allocated_bytes_);
+        Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * kv_row,
+                            error_msg, &s->allocated_bytes_);
     s->mtp_.v_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                      error_msg, &s->allocated_bytes_);
+        Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * kv_row,
+                            error_msg, &s->allocated_bytes_);
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
@@ -1482,8 +1527,8 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const std::size_t kv =
-      2 * std::size_t{max_context} * c.AttentionKvDim() * sizeof(__half);
+  const std::size_t kv = 2 * std::size_t{max_context} *
+                         KvRowBytes(c.AttentionKvDim(), options_.kv_cache_type);
   const std::size_t index =
       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
           c.indexer_head_dim * sizeof(float) +
@@ -2471,6 +2516,35 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   return Dense(l.ssm_out, s_.gdn_out, out, n_tokens, error_msg);
 }
 
+bool Executor::ProduceCacheOnlyKv(const DeviceLayer& l, float* key,
+                                  float* value, void* key_cache,
+                                  void* value_cache, std::uint32_t rows,
+                                  const std::uint32_t* position,
+                                  const qwen::vision::DeviceRope* rope,
+                                  YarnRope yarn, std::string* error_msg) const {
+  const auto& c = config();
+  const bool ok = detail::ProduceKvRows(
+      options_.kv_cache_type,
+      [&] {
+        RmsNormRows(key, l.attn_k_norm.f32(), key, rows * c.num_kv_heads,
+                    c.head_dim, 1, c.rms_eps, stream_);
+        Rope(key, rows, c.num_kv_heads, c.head_dim, c.rotary_dim, position,
+             c.rope_theta, stream_, rope, yarn);
+      },
+      [&](bool is_value, KvRotationKind kind) {
+        return RotateKvRows(is_value ? value : key, rows, c.num_kv_heads,
+                            c.head_dim, kind, stream_);
+      },
+      [&](bool is_value) {
+        StoreKv(is_value ? value : key, is_value ? value_cache : key_cache,
+                rows, c.AttentionKvDim(), position, stream_,
+                options_.kv_cache_type);
+      });
+  if (!ok)
+    AssignError(error_msg, "rotated cache-only producer geometry failed");
+  return ok;
+}
+
 bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          const float* x, float* out, std::uint32_t n_tokens,
                          const std::uint32_t* pos,
@@ -2482,8 +2556,22 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::uint32_t checkpoint_tokens) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
+  const bool view_eligible = options_.kv_cache_type == KvCacheType::kQ8_0 &&
+                             n_tokens >= 256 && MatrixRows(n_tokens) &&
+                             !last_only && (!has_mtp() || &l != &model_->mtp());
+  if (view_eligible &&
+      !detail::Q8PrefillViewFits(context_capacity_, start_pos, n_tokens)) {
+    AssignError(error_msg, "q8 prefill F16 view frontier exceeds capacity");
+    return false;
+  }
+  // The shared view is scratch, not a context limit. Direct API sessions may
+  // exceed the configured size; keep their full canonical packed-KV path.
+  const bool f16_view =
+      view_eligible &&
+      detail::Q8PrefillViewFits(q8_prefill_capacity_, start_pos, n_tokens);
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
+  const bool rotated = KvIsRotated(options_.kv_cache_type);
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
@@ -2491,14 +2579,14 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
         c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
-        c.rotary_dim == 64;
+        c.rotary_dim == 64 && !rotated;
     if (fused_projection) {
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
       prepared = AttentionF16Gemm(
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
           s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope, yarn_);
+          s.rope, yarn_, options_.kv_cache_type);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -2508,11 +2596,12 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           !Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
         return false;
       }
-      prepared = PrepareAttention(
-          s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
-          s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
-          c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-          c.rms_eps, stream_, s.rope, prefill_phase, yarn_);
+      prepared = PrepareAttention(s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(),
+                                  l.attn_k_norm.f32(), s_.q, s_.attn_gate,
+                                  s.k_cache, s.v_cache, n_tokens, c.num_heads,
+                                  c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
+                                  c.rope_theta, c.rms_eps, stream_, s.rope,
+                                  prefill_phase, yarn_, options_.kv_cache_type);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -2539,8 +2628,19 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
          c.rope_theta, stream_, s.rope, yarn_);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
          c.rope_theta, stream_, s.rope, yarn_);
-    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
-    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
+    if (rotated && (!RotateKvRows(s_.q, n_tokens, c.num_heads, c.head_dim,
+                                  KvRotationKind::kKeyQuery, stream_) ||
+                    !RotateKvRows(s_.k, n_tokens, c.num_kv_heads, c.head_dim,
+                                  KvRotationKind::kKeyQuery, stream_) ||
+                    !RotateKvRows(s_.v, n_tokens, c.num_kv_heads, c.head_dim,
+                                  KvRotationKind::kValueOutput, stream_))) {
+      AssignError(error_msg, "rotated attention producer geometry failed");
+      return false;
+    }
+    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_,
+            options_.kv_cache_type);
+    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_,
+            options_.kv_cache_type);
   }
 
   // Raw keys survive only until pooling. The ring holds the initial
@@ -2612,6 +2712,24 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
              "partial attention output initialization", error_msg)) {
     return false;
   }
+  const void* wmma_k = s.k_cache;
+  const void* wmma_v = s.v_cache;
+  auto wmma_kv_type = options_.kv_cache_type;
+  if (f16_view) {
+    // Restage stored q8 bytes, retaining their scale/product half rounding.
+    // Wide calls are uncaptured. Both checkpoint ranges consume this view
+    // before the next layer/call overwrites it on the same stream.
+    if (q8_prefill_k_f16_ == nullptr || q8_prefill_v_f16_ == nullptr ||
+        !DequantizeQ8Kv(s.k_cache, s.v_cache, q8_prefill_k_f16_,
+                        q8_prefill_v_f16_, start_pos + n_tokens, kv_row,
+                        stream_)) {
+      AssignError(error_msg, "q8 prefill F16 view reconstruction failed");
+      return false;
+    }
+    wmma_k = q8_prefill_k_f16_;
+    wmma_v = q8_prefill_v_f16_;
+    wmma_kv_type = KvCacheType::kF16;
+  }
   // Queries before the token budget always take the dense tiles, also in a
   // batch that crosses it, so each position's key sweep (and its rounding)
   // does not depend on where the prefill chunks fall. The sparse part goes
@@ -2626,18 +2744,41 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     };
     return (dense_rows == rows ||
             WmmaCausalAttention(
-                s_.q + at(dense_rows), s_.attn_gate + at(dense_rows), s.k_cache,
-                s.v_cache,
+                s_.q + at(dense_rows),
+                rotated ? nullptr : s_.attn_gate + at(dense_rows), wmma_k,
+                wmma_v,
                 mask ? mask + std::size_t{first + dense_rows} * mask_words_
                      : nullptr,
                 mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
                 pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
-                c.compress_ratio, stream_, last)) &&
+                c.compress_ratio, stream_, last, wmma_kv_type)) &&
            (dense_rows == 0 || (last && dense_rows != rows) ||
-            WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
-                                s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
-                                dense_rows, pos, c.num_heads, c.num_kv_heads,
-                                c.head_dim, c.compress_ratio, stream_, last));
+            WmmaCausalAttention(
+                s_.q + at(0), rotated ? nullptr : s_.attn_gate + at(0), wmma_k,
+                wmma_v, nullptr, mask_words_, s_.ctx + at(0), dense_rows, pos,
+                c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio,
+                stream_, last, wmma_kv_type));
+  };
+  const auto inverse_rows = [&](std::uint32_t first, std::uint32_t rows) {
+    if (!rotated || rows == 0)
+      return true;
+    if (!RotateKvRows(s_.ctx + std::size_t{first} * c.AttentionQDim(), rows,
+                      c.num_heads, c.head_dim, KvRotationKind::kValueOutput,
+                      stream_)) {
+      AssignError(error_msg, "rotated attention inverse geometry failed");
+      return false;
+    }
+    return true;
+  };
+  const auto finish_wide = [&](std::uint32_t first, std::uint32_t rows) {
+    if (!inverse_rows(first, rows))
+      return false;
+    if (rotated && rows != 0) {
+      const std::size_t offset = std::size_t{first} * c.AttentionQDim();
+      SigmoidMul(s_.ctx + offset, s_.attn_gate + offset,
+                 std::size_t{rows} * c.AttentionQDim(), stream_);
+    }
+    return true;
   };
   if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
     // Sparse tiles compact the union of their queries' selected keys.
@@ -2647,22 +2788,39 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       AssignError(error_msg, "checkpoint attention geometry is unsupported");
       return false;
     }
+    if (!finish_wide(0, n_tokens))
+      return false;
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
   if (MatrixRows(n_tokens) && attend(0, n_tokens, last_only)) {
+    const auto sparse_begin =
+        start_pos < c.indexer_top_k ? c.indexer_top_k - start_pos : 0U;
+    const auto first =
+        !last_only ? 0U
+        : sparse && start_pos + n_tokens > c.indexer_top_k
+            ? sparse_begin + (n_tokens - sparse_begin - 1) / 4 * 4
+            : (n_tokens - 1) / 16 * 16;
+    if (!finish_wide(first, n_tokens - first))
+      return false;
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
   const bool split = !MatrixRows(n_tokens);
-  rocm::Attention(
-      s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
-      split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens, pos,
-      c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
-      split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
-      c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0);
+  rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
+                  split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
+                  pos, c.num_heads, c.num_kv_heads, c.head_dim,
+                  c.compress_ratio, stream_, split ? s_.attn_lists : nullptr,
+                  split ? s_.attn_counts : nullptr,
+                  c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
+                  options_.kv_cache_type);
+  // Includes wide-WMMA refusal -> unsplit narrow fallback. The existing
+  // reader has completed all split merges before this inverse. Gate exactly
+  // once below, even when a batched/MTP caller projects the output later.
+  if (!inverse_rows(0, n_tokens))
+    return false;
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   // A decode batch's output projection reads the gate's Q8_1 rows.
@@ -3473,7 +3631,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
 }
 
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
-                                             'N', 'A', 'P', '6'};
+                                             'N', 'A', 'P', '7'};
 
 /// Fixed header ahead of the section bytes. It carries every geometry
 /// value the section sizes derive from, so a payload of another artifact
@@ -3485,6 +3643,8 @@ struct SnapshotHeader {
   std::uint32_t conv_elems;
   std::uint32_t state_elems;
   std::uint32_t kv_row;
+  std::uint32_t kv_cache_type;
+  std::uint32_t numerics_epoch;
   std::uint32_t indexer_head_dim;
   std::uint32_t compress_ratio;
   std::uint32_t hc_dim;
@@ -3507,7 +3667,7 @@ struct SnapshotHeader {
 };
 static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
 // The four rope fields must not push payload_bytes off its 8-byte alignment.
-static_assert(offsetof(SnapshotHeader, payload_bytes) == 104);
+static_assert(offsetof(SnapshotHeader, payload_bytes) == 112);
 
 namespace {
 
@@ -3520,6 +3680,8 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.conv_elems = (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   h.state_elems = c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim;
   h.kv_row = c.AttentionKvDim();
+  h.kv_cache_type = static_cast<std::uint32_t>(session.kv_cache_type());
+  h.numerics_epoch = ExpectedKvPayloadVersion(session.kv_cache_type());
   h.indexer_head_dim = c.indexer_head_dim;
   h.compress_ratio = c.compress_ratio;
   h.hc_dim = c.HcDim();
@@ -3548,7 +3710,8 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
   return h.magic == mine.magic && h.num_layers == mine.num_layers &&
          h.full_attention_interval == mine.full_attention_interval &&
          h.conv_elems == mine.conv_elems && h.state_elems == mine.state_elems &&
-         h.kv_row == mine.kv_row &&
+         h.kv_row == mine.kv_row && h.kv_cache_type == mine.kv_cache_type &&
+         h.numerics_epoch == mine.numerics_epoch &&
          h.indexer_head_dim == mine.indexer_head_dim &&
          h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
          h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp &&
@@ -3566,9 +3729,9 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   std::uint64_t offset = sizeof(SnapshotHeader);
   const auto region = [&](void* device, std::uint64_t bytes, const char* what,
                           std::uint64_t row_bytes = 0, bool draft = false,
-                          bool pooled = false) {
-    if (bytes != 0 &&
-        !visit(device, offset, bytes, what, row_bytes, draft, pooled)) {
+                          bool pooled = false, bool ordinary_kv = false) {
+    if (bytes != 0 && !visit(device, offset, bytes, what, row_bytes, draft,
+                             pooled, ordinary_kv)) {
       return false;
     }
     offset += bytes;
@@ -3597,8 +3760,9 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
               std::uint64_t{h.ple_elems} * sizeof(float), "PLE history")) {
     return 0;
   }
-  const std::uint64_t kv_bytes =
-      std::uint64_t{h.position} * h.kv_row * sizeof(__half);
+  const auto kv_row_bytes =
+      KvRowBytes(h.kv_row, static_cast<KvCacheType>(h.kv_cache_type));
+  const std::uint64_t kv_bytes = std::uint64_t{h.position} * kv_row_bytes;
   const std::uint64_t index_row_bytes =
       std::uint64_t{h.indexer_head_dim} * sizeof(float);
   const std::uint32_t index_begin = h.blocks * h.compress_ratio;
@@ -3609,9 +3773,9 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
       if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache",
-                  std::uint64_t{h.kv_row} * sizeof(__half)) ||
+                  kv_row_bytes, false, false, true) ||
           !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache",
-                  std::uint64_t{h.kv_row} * sizeof(__half))) {
+                  kv_row_bytes, false, false, true)) {
         return 0;
       }
       // Serialize only unpooled rows, in chronological order. The physical
@@ -3659,13 +3823,11 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
             std::uint64_t{h.indexer_head_dim} * sizeof(__half), true, true))
       return 0;
     const std::uint64_t mtp_kv_bytes =
-        std::uint64_t{h.mtp_position} * h.kv_row * sizeof(__half);
+        std::uint64_t{h.mtp_position} * kv_row_bytes;
     if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_kv_bytes,
-                "draft K cache", std::uint64_t{h.kv_row} * sizeof(__half),
-                true) ||
+                "draft K cache", kv_row_bytes, true, false, true) ||
         !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_kv_bytes,
-                "draft V cache", std::uint64_t{h.kv_row} * sizeof(__half),
-                true) ||
+                "draft V cache", kv_row_bytes, true, false, true) ||
         !region(
             mtp != nullptr ? mtp->h : nullptr,
             h.mtp_residual_valid ? std::uint64_t{h.hc_dim} * sizeof(float) : 0,
@@ -3691,7 +3853,7 @@ std::uint64_t Executor::SnapshotBytes(const Session& session,
   h.hidden_rows = hidden_rows;
   return WalkSnapshot(h, nullptr,
                       [](void*, std::uint64_t, std::uint64_t, const char*,
-                         std::uint64_t, bool, bool) { return true; });
+                         std::uint64_t, bool, bool, bool) { return true; });
 }
 
 bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
@@ -3744,22 +3906,24 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     pending->storage_ = std::move(storage);
     pending->payload_ = payload.data();
     std::uint64_t mutable_prefix = sizeof(SnapshotHeader);
-    (void)WalkSnapshot(h, nullptr,
-                       [&](void*, std::uint64_t offset, std::uint64_t bytes,
-                           const char*, std::uint64_t row_bytes, bool, bool) {
-                         if (row_bytes != 0)
-                           return false;
-                         mutable_prefix = offset + bytes;
-                         return true;
-                       });
+    (void)WalkSnapshot(
+        h, nullptr,
+        [&](void*, std::uint64_t offset, std::uint64_t bytes, const char*,
+            std::uint64_t row_bytes, bool, bool, bool) {
+          if (row_bytes != 0)
+            return false;
+          mutable_prefix = offset + bytes;
+          return true;
+        });
     std::uint64_t extra_bytes = 0;
-    (void)WalkSnapshot(h, nullptr,
-                       [&](void*, std::uint64_t offset, std::uint64_t bytes,
-                           const char*, std::uint64_t row_bytes, bool, bool) {
-                         if (row_bytes == 0 && offset >= mutable_prefix)
-                           extra_bytes += bytes;
-                         return true;
-                       });
+    (void)WalkSnapshot(
+        h, nullptr,
+        [&](void*, std::uint64_t offset, std::uint64_t bytes, const char*,
+            std::uint64_t row_bytes, bool, bool, bool) {
+          if (row_bytes == 0 && offset >= mutable_prefix)
+            extra_bytes += bytes;
+          return true;
+        });
     pending->mutable_offset_ = sizeof(SnapshotHeader);
     pending->mutable_bytes_ = mutable_prefix - sizeof(SnapshotHeader);
     try {
@@ -3791,7 +3955,8 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
       WalkSnapshot(
           h, &session,
           [&](void* device, std::uint64_t offset, std::uint64_t bytes,
-              const char*, std::uint64_t row_bytes, bool draft, bool pooled) {
+              const char*, std::uint64_t row_bytes, bool draft, bool pooled,
+              bool) {
             if (!session.CheckCancellation(error_msg))
               return false;
             if (pending && row_bytes != 0) {
@@ -3863,7 +4028,7 @@ std::uint64_t Executor::PrefillCheckpointBytes(const Session& session,
   }
   return WalkSnapshot(h, nullptr,
                       [](void*, std::uint64_t, std::uint64_t, const char*,
-                         std::uint64_t, bool, bool) { return true; });
+                         std::uint64_t, bool, bool, bool) { return true; });
 }
 
 bool Executor::RestoreSnapshot(Session& session,
@@ -3871,6 +4036,8 @@ bool Executor::RestoreSnapshot(Session& session,
                                SnapshotInfo* info, std::string* error_msg,
                                std::uint32_t next_drafts,
                                const SnapshotState* deferred) const {
+  if (info != nullptr)
+    *info = {};
   if (session.owner_ != this) {
     AssignError(error_msg, "session belongs to another executor");
     return false;
@@ -3910,10 +4077,32 @@ bool Executor::RestoreSnapshot(Session& session,
   if (h.payload_bytes != payload.size() ||
       WalkSnapshot(h, nullptr,
                    [](void*, std::uint64_t, std::uint64_t, const char*,
-                      std::uint64_t, bool, bool) { return true; }) !=
+                      std::uint64_t, bool, bool, bool) { return true; }) !=
           payload.size()) {
     AssignError(error_msg, "snapshot payload size does not match its header");
     return false;
+  }
+  // Untrusted byte payloads are validated completely before changing any
+  // session state. A deferred in-process snapshot borrows canonical live
+  // storage, not these as-yet-unmaterialized host rows.
+  if (KvUsesQ8Codec(session.kv_cache_type_) && deferred == nullptr) {
+    try {
+      WalkSnapshot(
+          h, nullptr,
+          [&](void*, std::uint64_t offset, std::uint64_t bytes, const char*,
+              std::uint64_t row_bytes, bool, bool, bool ordinary_kv) {
+            if (ordinary_kv) {
+              for (std::uint64_t row = 0; row < bytes; row += row_bytes)
+                ValidateKvRow(
+                    std::as_bytes(payload.subspan(offset + row, row_bytes)),
+                    h.kv_row, KvCacheType::kQ8_0);
+            }
+            return true;
+          });
+    } catch (const std::exception& e) {
+      AssignError(error_msg, e.what());
+      return false;
+    }
   }
   qwen::vision::RopeLayout layout;
   layout.images.resize(h.image_count);
@@ -3935,6 +4124,11 @@ bool Executor::RestoreSnapshot(Session& session,
                 "image snapshot layout does not match its prompt attachment");
     return false;
   }
+  // Preflight is complete. From here a failure may have changed vision,
+  // provenance, rollback scratch or live bytes, so the public session must
+  // invalidate instead of retaining its old logits/history.
+  if (info != nullptr)
+    info->mutation_started = true;
   if (layout.images.empty())
     session.ConfigureVision(nullptr, nullptr, stream_);
   // The session's queued work targets buffers the copies overwrite.
@@ -4046,7 +4240,7 @@ bool Executor::RestoreSnapshot(Session& session,
           h, &session,
           [&](void* device, std::uint64_t offset, std::uint64_t bytes,
               const char* what, std::uint64_t row_bytes, bool draft,
-              bool pooled) {
+              bool pooled, bool) {
             const auto original_offset = offset;
             const auto original_bytes = bytes;
             if (deferred && row_bytes != 0) {
@@ -4506,7 +4700,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       control_host_->hidden_row >= 0 && n > 2 && n <= kVecBatch
           ? n - 2
           : (last_only && n >= 224 ? (n - 96) / 128 * 128 : 0U);
-  const bool cache_only = kv_only && !l.attn_qkv.empty();
+  const bool cache_only = kv_only;
   if (!HcMixBatch(l.hc_attn, s_.mtp_res, false, s_.mixed,
                   cache_only ? nullptr : s_.inject, n, error_msg)) {
     return false;
@@ -4515,19 +4709,30 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     // Known trunk rows replace the predictor residual on the next forward.
     // Only K/V and pooled indexer keys survive this catch-up. Slice the
     // packed Q/gate/K/V weight without copying or changing its arithmetic.
-    auto kv = l.attn_qkv;
-    const TensorRef layout{.type = kv.type, .cols = kv.cols};
-    kv.data = static_cast<std::uint8_t*>(kv.data) +
-              std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
-    kv.rows = 2 * c.AttentionKvDim();
-    if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
-        !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,
-                          nullptr, attn.k_cache, attn.v_cache, n, 0,
-                          c.num_kv_heads, c.head_dim, c.rotary_dim,
-                          &session.control_->mtp_position, c.rope_theta,
-                          c.rms_eps, stream_, attn.rope, false, yarn_)) {
-      AssignError(error_msg, "MTP cache projection failed");
-      return false;
+    if (!l.attn_qkv.empty()) {
+      auto kv = l.attn_qkv;
+      const TensorRef layout{.type = kv.type, .cols = kv.cols};
+      kv.data = static_cast<std::uint8_t*>(kv.data) +
+                std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
+      kv.rows = 2 * c.AttentionKvDim();
+      if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
+          !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(),
+                            nullptr, nullptr, attn.k_cache, attn.v_cache, n, 0,
+                            c.num_kv_heads, c.head_dim, c.rotary_dim,
+                            &session.control_->mtp_position, c.rope_theta,
+                            c.rms_eps, stream_, attn.rope, false, yarn_,
+                            options_.kv_cache_type)) {
+        AssignError(error_msg, "MTP cache projection failed");
+        return false;
+      }
+    } else {
+      if (!DenseBatch(l.attn_k, s_.mixed, s_.k, n, error_msg) ||
+          !DenseBatch(l.attn_v, s_.mixed, s_.v, n, error_msg))
+        return false;
+      if (!ProduceCacheOnlyKv(l, s_.k, s_.v, attn.k_cache, attn.v_cache, n,
+                              &session.control_->mtp_position, attn.rope, yarn_,
+                              error_msg))
+        return false;
     }
     const auto capacity =
         IndexerCapacity(c, options_.max_batch, session.max_context_);

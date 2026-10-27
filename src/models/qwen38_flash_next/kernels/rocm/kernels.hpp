@@ -9,6 +9,8 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
+#include "src/models/qwen38_flash_next/kv_cache.hpp"
+#include "src/models/qwen38_flash_next/kv_rotation.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
@@ -211,11 +213,12 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
 /// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
-                      float* gate, __half* keys, __half* values,
+                      float* gate, void* keys, void* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      const YarnRope& yarn = {});
+                      const YarnRope& yarn = {},
+                      KvCacheType cache_type = KvCacheType::kF16);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -420,13 +423,21 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
 /// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
-                      float* gate, __half* k_cache, __half* v_cache,
+                      float* gate, void* k_cache, void* v_cache,
                       std::uint32_t n_tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false, const YarnRope& yarn = {});
+                      bool prefill = false, const YarnRope& yarn = {},
+                      KvCacheType cache_type = KvCacheType::kF16);
+
+/// Revision-23 row-local FWHT, in-place, with D256 heads. H256 for Q/K;
+/// four H64 blocks for V/output. This is also the self-inverse output step,
+/// which MUST precede the existing sigmoid gate. False launches nothing.
+/// Transient nonzero F32 bits are exact; +0/-0 are value-equivalent.
+bool RotateKvRows(float* x, std::uint32_t n_tokens, std::uint32_t heads,
+                  std::uint32_t d, KvRotationKind kind, hipStream_t stream);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
@@ -441,9 +452,15 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
 
 /// Stores f32 rows into the f16 cache at positions start_pos + t:
 /// cache[(start_pos + t)][row_dim].
-void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
+void StoreKv(const float* src, void* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
-             hipStream_t stream);
+             hipStream_t stream, KvCacheType cache_type = KvCacheType::kF16);
+/// Reconstruct populated canonical q8 rows into executor-owned transient
+/// F16 views. The caller owns full row-sized outputs and stream ordering.
+bool DequantizeQ8Kv(const void* k_cache, const void* v_cache, void* k_f16,
+                    void* v_f16, std::uint32_t rows, std::uint32_t width,
+                    hipStream_t stream);
+
 /// Stores raw indexer rows in a power-of-two ring of `capacity` rows.
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                std::uint32_t row_dim, const std::uint32_t* start_pos,
@@ -488,14 +505,14 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// mask at ratio 4, each row's selected blocks are first compacted once into
 /// `lists`; `list_capacity` is the selection budget (blocks per row). The
 /// output is bitwise identical to the mask walk. Null lists use the mask walk.
-void Attention(const float* q, const __half* k_cache, const __half* v_cache,
+void Attention(const float* q, const void* k_cache, const void* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists = nullptr,
-               std::uint32_t* counts = nullptr,
-               std::uint32_t list_capacity = 0);
+               std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
+               KvCacheType cache_type = KvCacheType::kF16);
 
 /// Maximum visible sparse context for this WMMA geometry, or zero when the
 /// geometry is unsupported. Checkpoint planning uses the same dispatch limit.
@@ -511,14 +528,14 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
 /// Returns false when the visible extent exceeds 262,144 tokens; the caller
 /// falls back to Attention.
-bool WmmaCausalAttention(const float* q, const float* gate,
-                         const __half* k_cache, const __half* v_cache,
-                         const std::uint32_t* mask, std::uint32_t mask_words,
-                         float* out, std::uint32_t n_tokens,
-                         std::uint32_t start_pos, std::uint32_t heads,
-                         std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
+bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
+                         const void* v_cache, const std::uint32_t* mask,
+                         std::uint32_t mask_words, float* out,
+                         std::uint32_t n_tokens, std::uint32_t start_pos,
+                         std::uint32_t heads, std::uint32_t kv_heads,
+                         std::uint32_t d, std::uint32_t ratio,
+                         hipStream_t stream, bool last_only = false,
+                         KvCacheType cache_type = KvCacheType::kF16);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

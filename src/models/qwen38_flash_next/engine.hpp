@@ -19,6 +19,7 @@
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/kv_cache.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -57,6 +58,9 @@ struct ModelOptions {
   /// artifact's own setting, which is always off: no GGUF metadata key sets
   /// it today.
   std::optional<RopeScaling> rope_scaling{};
+  /// Ordinary trunk and MTP K/V only; indexer and recurrent state are
+  /// unchanged.
+  KvCacheType kv_cache_type = KvCacheType::kF16;
 };
 
 class Session;
@@ -90,6 +94,9 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  [[nodiscard]] KvCacheType CacheType() const noexcept {
+    return options_.kv_cache_type;
+  }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
@@ -236,8 +243,17 @@ public:
   /// a PLE table.
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
-  /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 18;
+  /// F16/plain compatibility version. Type-dependent producers and checkers
+  /// use ExpectedKvPayloadVersion; older or mismatched state is rejected.
+  static constexpr std::uint32_t kSnapshotPayloadVersion =
+      kKvCacheNumericsEpoch;
+  /// Portable preflight shared with CPU tests; unknown types fail closed even
+  /// when both a malformed payload and caller happen to name the same value.
+  [[nodiscard]] static constexpr bool IsCompatibleSnapshotPayload(
+      std::uint32_t version, KvCacheType type, KvCacheType expected) noexcept {
+    return IsKnownKvCacheType(type) && IsKnownKvCacheType(expected) &&
+           type == expected && version == ExpectedKvPayloadVersion(expected);
+  }
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(

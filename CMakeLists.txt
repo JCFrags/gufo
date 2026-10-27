@@ -735,9 +735,28 @@ if (BUILD_TESTING)
     src/cli/serve/continuation_cache.cpp
     src/cli/serve/continuation_disk_store.cpp
     src/cli/serve/text_model_runner.cpp)
-  target_link_libraries(component_text_cache_test PRIVATE gufo_cache_fake gufo_core gufo_logging)
+  target_link_libraries(component_text_cache_test PRIVATE gufo_cache_fake gufo_core gufo_logging gufo_qwen38_flash_next)
   add_test(NAME component_text_cache_test COMMAND component_text_cache_test)
   set_tests_properties(component_text_cache_test PROPERTIES LABELS "cpu;server;cache;state;lifecycle")
+  add_test(NAME qfn_packed_ingress_publication_test
+    COMMAND ${CMAKE_COMMAND} -E env GUFO_TEST_PACKED_INGRESS_ONLY=1
+      $<TARGET_FILE:component_text_cache_test>)
+  set_tests_properties(qfn_packed_ingress_publication_test PROPERTIES
+    LABELS "cpu;server;cache;qwen38_flash_next")
+  add_test(NAME qfn_rotated_process_local_disk_test
+    COMMAND ${CMAKE_COMMAND} -E env GUFO_TEST_ROTATED_PROCESS_LOCAL_ONLY=disk
+      $<TARGET_FILE:component_text_cache_test>)
+  set_tests_properties(qfn_rotated_process_local_disk_test PROPERTIES
+    LABELS "cpu;server;cache;qwen38_flash_next")
+  add_executable(qfn_kv_ingress_validation_test
+    tests/cli/qfn_kv_ingress_validation_test.cpp)
+  target_link_libraries(qfn_kv_ingress_validation_test PRIVATE
+    gufo_qwen38_flash_next gufo_cache)
+  target_compile_options(qfn_kv_ingress_validation_test PRIVATE
+    -fno-fast-math -ffp-contract=off -frounding-math)
+  add_test(NAME qfn_kv_ingress_validation_test COMMAND qfn_kv_ingress_validation_test)
+  set_tests_properties(qfn_kv_ingress_validation_test PROPERTIES
+    LABELS "cpu;server;cache;qwen38_flash_next")
 
   add_executable(text_model_runner_test
     tests/cli/text_model_runner_test.cpp

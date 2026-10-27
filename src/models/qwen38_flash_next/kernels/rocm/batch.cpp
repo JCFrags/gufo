@@ -250,7 +250,6 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   const Scratch base = s_;
   const auto& l = model_->mtp();
   const bool cache_only =
-      !l.attn_qkv.empty() &&
       std::ranges::all_of(items, [](const auto& item) { return item.kv_only; });
   const auto body = [&]() {
     if (!AnyActive(items))
@@ -297,12 +296,18 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       // same invariant projections, then stop before queries, attention,
       // the output projection and FFN whose residual would be discarded.
       auto kv = l.attn_qkv;
-      const TensorRef layout{.type = kv.type, .cols = kv.cols};
-      kv.data = static_cast<std::uint8_t*>(kv.data) +
-                std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
-      kv.rows = 2 * c.AttentionKvDim();
-      if (!DenseBatch(kv, base.mixed, base.qg, rows, error) ||
-          !DenseBatch(l.indexer_k, base.mixed, base.ik, rows, error))
+      if (!kv.empty()) {
+        const TensorRef layout{.type = kv.type, .cols = kv.cols};
+        kv.data = static_cast<std::uint8_t*>(kv.data) +
+                  std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
+        kv.rows = 2 * c.AttentionKvDim();
+        if (!DenseBatch(kv, base.mixed, base.qg, rows, error))
+          return false;
+      } else if (!DenseBatch(l.attn_k, base.mixed, base.k, rows, error) ||
+                 !DenseBatch(l.attn_v, base.mixed, base.v, rows, error)) {
+        return false;
+      }
+      if (!DenseBatch(l.indexer_k, base.mixed, base.ik, rows, error))
         return false;
       for (std::size_t i = 0; i < items.size(); ++i) {
         auto& session = *items[i].session;
@@ -312,13 +317,24 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         session.mtp_.residual_valid = false;
         const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
         const auto capacity = session.index_capacity_;
-        if (!PrepareAttention(
-                base.qg + std::size_t{offsets[i]} * kv.rows, kv.rows, nullptr,
-                l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
-                session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
-                c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-                c.rms_eps, stream_, session.vision_input_.rope(), false, yarn_))
-          return Fail(error, "batched MTP cache projection failed");
+        if (!kv.empty()) {
+          if (!PrepareAttention(
+                  base.qg + std::size_t{offsets[i]} * kv.rows, kv.rows, nullptr,
+                  l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
+                  session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
+                  c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
+                  c.rms_eps, stream_, session.vision_input_.rope(), false,
+                  yarn_, options_.kv_cache_type))
+            return Fail(error, "batched MTP cache projection failed");
+        } else {
+          auto* key = base.k + std::size_t{offsets[i]} * c.AttentionKvDim();
+          auto* value = base.v + std::size_t{offsets[i]} * c.AttentionKvDim();
+          if (!ProduceCacheOnlyKv(l, key, value, session.mtp_.k_cache,
+                                  session.mtp_.v_cache, n,
+                                  &session.control_->mtp_position,
+                                  session.vision_input_.rope(), yarn_, error))
+            return false;
+        }
         StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
                   session.mtp_.index_k, n, c.indexer_head_dim,
                   &session.control_->mtp_position, capacity, stream_);

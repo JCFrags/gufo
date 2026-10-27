@@ -14,6 +14,10 @@ endfunction()
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(kv_cache gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(kv_rotation gufo_qwen38_flash_next "cpu")
+target_compile_options(qwen38_flash_next_kv_rotation_test PRIVATE
+  -fno-fast-math -ffp-contract=off -frounding-math)
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
 add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
@@ -30,11 +34,29 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
+  add_qwen38_flash_next_test(kv_rotation_ops gufo_qwen38_flash_next "hip;gpu;gfx1151")
+  target_sources(qwen38_flash_next_kv_rotation_ops_test PRIVATE
+    kv_rotation_producer_native.cpp)
+  target_compile_options(qwen38_flash_next_kv_rotation_ops_test PRIVATE
+    -fno-fast-math -ffp-contract=off -frounding-math)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
-      attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
-      select_ops snapshot_copy verification_sampling)
+      attention_ops kv_q8_ops moe_epilogue_ops moe_ids_ops projection_ops
+      routed_wmma_ops select_ops snapshot_copy verification_sampling)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
+  # Compile the actual private q8 load helper under production HIP flags;
+  # exhaust its valid finite scale/code domain against the portable codec.
+  add_executable(qwen38_flash_next_kv_q8_load_test kv_q8_load_test.hip)
+  target_link_libraries(qwen38_flash_next_kv_q8_load_test PRIVATE
+    gufo_qwen38_flash_next hip::host)
+  target_compile_options(qwen38_flash_next_kv_q8_load_test PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only>)
+  add_test(NAME qwen38_flash_next.kv_q8_load
+    COMMAND qwen38_flash_next_kv_q8_load_test)
+  set_tests_properties(qwen38_flash_next.kv_q8_load PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151" TIMEOUT 60)
+  add_dependencies(qwen38_flash_next_tests qwen38_flash_next_kv_q8_load_test)
+
   # The rope phase and RMS checks compare against the scalar CPU oracle.
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
     gufo_qwen38_flash_next_reference)
@@ -49,7 +71,7 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_session_test PRIVATE gufo_logging
     gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_cache_hip hip::host)
   add_executable(qwen38_flash_next_snapshot_test EXCLUDE_FROM_ALL snapshot_test.cpp
-    device_headroom_fault.cpp)
+    device_headroom_fault.cpp yarn_producer_native.cpp)
   target_link_libraries(qwen38_flash_next_snapshot_test PRIVATE
     gufo_qwen38_flash_next ${CMAKE_DL_LIBS})
   add_executable(qwen38_flash_next_continuation_adapter_test EXCLUDE_FROM_ALL

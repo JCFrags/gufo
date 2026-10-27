@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/kv_cache_options.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
@@ -35,6 +36,7 @@
 #include "src/models/qwen/vision/image_cache.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
+#include "src/cli/serve/qfn_kv_ingress_validation.hpp"
 #include "src/core/hip/committed_backing.hpp"
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
@@ -289,7 +291,8 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
 std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
     bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
-    std::uint32_t decode_concurrency, std::string_view position_policy) {
+    std::uint32_t decode_concurrency, std::string_view position_policy,
+    models::qwen38_flash_next::KvCacheType kv_cache_type) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
         "Qwen3.8-Flash-Next disk cache requires an artifact fingerprint");
@@ -310,8 +313,10 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
            << "state_abi=qwen38-flash-next-rocm-session-v1\n"
            << "payload_layout=qfn-rocm-session-snapshot-v"
-           << models::qwen38_flash_next::Session::kSnapshotPayloadVersion
+           << models::qwen38_flash_next::ExpectedKvPayloadVersion(kv_cache_type)
            << '\n'
+           << models::qwen38_flash_next::KvCacheCompatibilityIdentity(
+                  kv_cache_type)
            << "context_tokens=" << max_context << '\n'
            << "position_policy=" << position_policy << '\n'
            << "adapters=none\n";
@@ -2432,9 +2437,11 @@ public:
               use_mtp_, max_context_, max_draft_tokens_,
               model_->DecodeConcurrency(),
               models::qwen38_flash_next::RopePositionPolicy(
-                  model_->config().rope_scaling)),
+                  model_->config().rope_scaling),
+              model_->CacheType()),
           .payload_version =
-              models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
+              models::qwen38_flash_next::ExpectedKvPayloadVersion(
+                  model_->CacheType()),
       };
       component_identity_ = persistence_->compatibility_identity;
     } else {
@@ -2445,7 +2452,9 @@ public:
                << "mtp=" << use_mtp_ << '\n'
                << "draft_max_tokens=" << max_draft_tokens_ << '\n'
                << "draft_cost_concurrency=" << model_->DecodeConcurrency()
-               << '\n';
+               << '\n'
+               << models::qwen38_flash_next::KvCacheCompatibilityIdentity(
+                      model_->CacheType());
       const auto canonical = identity.str();
       component_identity_.assign(canonical.begin(), canonical.end());
     }
@@ -2456,13 +2465,17 @@ public:
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
     (void)ram;
-    return CreateHipComponentCacheResources(
+    auto resources = CreateHipComponentCacheResources(
         std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
             model_,
             use_mtp_ ? core::SessionMode::kSpeculative
                      : core::SessionMode::kAutoregressive,
             max_context_, component_identity_),
         ledger);
+    detail::InstallQfnPackedKvIngressValidation(*resources, model_->config(),
+                                                use_mtp_, max_context_,
+                                                model_->CacheType());
+    return resources;
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
@@ -3046,16 +3059,15 @@ InferenceBackend::InferenceBackend() : impl_(std::make_unique<Impl>()) {}
 
 InferenceBackend::~InferenceBackend() = default;
 
-bool InferenceBackend::load(const std::string& model_path, std::string* error,
-                            std::uint32_t max_context,
-                            std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            const TextSpeculativeConfig& speculative_config,
-                            const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path,
-                            TextRunnerRamCacheOptions ram_cache_config,
-                            bool enable_yarn) {
+bool InferenceBackend::load(
+    const std::string& model_path, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    const TextSpeculativeConfig& speculative_config,
+    const TextDiskCacheConfig& disk_cache_config,
+    const std::string& vision_model_path,
+    TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
+    models::qwen38_flash_next::KvCacheType kv_cache_type) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3067,6 +3079,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
+  if (!cli::ValidateKvCacheTypeForArchitecture(kv_cache_type, architecture,
+                                               error))
+    return false;
   if (enable_yarn && architecture != "qwen4exp") {
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
@@ -3200,6 +3215,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
             .rope_scaling = rope_scaling,
+            .kv_cache_type = kv_cache_type,
         },
         &load_error);
     if (model == nullptr) {
@@ -3279,6 +3295,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)vision_model_path;
   (void)ram_cache_config;
   (void)enable_yarn;
+  (void)kv_cache_type;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif

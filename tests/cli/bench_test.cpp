@@ -32,6 +32,33 @@ void TestDefaultOptions() {
          "benchmark sampling defaults remain greedy");
 }
 
+void TestKvCacheType() {
+  using gufo::models::qwen38_flash_next::KvCacheType;
+  const auto defaults =
+      gufo::cli::ParseBenchOptions(std::array<const char*, 0>{});
+  Expect(defaults && defaults->kv_cache_type == KvCacheType::kF16,
+         "benchmark KV defaults to F16");
+  for (const auto value : {"f16", "q8_0"}) {
+    const auto parsed =
+        gufo::cli::ParseBenchOptions(std::array{"--kv-cache-type", value});
+    Expect(parsed && parsed->kv_cache_type == (std::string_view(value) == "f16"
+                                                   ? KvCacheType::kF16
+                                                   : KvCacheType::kQ8_0),
+           "benchmark parses canonical KV type names");
+  }
+  for (const auto value : {"", "q8", "Q8_0", "bf16", "q4_0"}) {
+    std::string error;
+    Expect(!gufo::cli::ParseBenchOptions(std::array{"--kv-cache-type", value},
+                                         &error) &&
+               error == "--kv-cache-type must be f16, q8_0 or q8_0-rotated",
+           "benchmark rejects unsupported KV types");
+  }
+  const auto rotated = gufo::cli::ParseBenchOptions(
+      std::array{"--kv-cache-type", "q8_0-rotated"});
+  Expect(rotated && rotated->kv_cache_type == KvCacheType::kQ8_0Rotated,
+         "benchmark parses explicit rotated selector");
+}
+
 void TestDs4SamplingOptions() {
   const std::array<const char*, 4> args = {"--temperature", "0.6", "--seed",
                                            "7"};
@@ -222,6 +249,7 @@ void TestFlashNextYarnRule() {
 
 int main() {
   TestDefaultOptions();
+  TestKvCacheType();
   TestDs4SamplingOptions();
   TestFlashMtpSamplingOptions();
   TestDepthOptions();

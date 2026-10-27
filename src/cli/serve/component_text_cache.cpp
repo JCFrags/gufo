@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -16,10 +17,40 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/os_info.hpp"
+#include "src/models/qwen38_flash_next/kv_cache.hpp"
 
 namespace gufo::server {
 namespace {
 using Clock = std::chrono::steady_clock;
+// Process-local runners may lack durable artifact fingerprints; their
+// registered append layout must still activate packed row admission.
+bool RotatedPackedIngress(
+    const TextRunnerDescriptor& descriptor,
+    std::span<const cache::ComponentDescriptor> components) {
+  namespace qfn = models::qwen38_flash_next;
+  if (descriptor.state_abi != "qwen38-flash-next-rocm-session-v1")
+    return false;
+  return (descriptor.persistence &&
+          descriptor.persistence->payload_version ==
+              qfn::ExpectedKvPayloadVersion(qfn::KvCacheType::kQ8_0Rotated)) ||
+         std::ranges::any_of(components, [](const auto& component) {
+           return component.kind == cache::ComponentKind::kAppendRows &&
+                  component.layout_version == 3;
+         });
+}
+bool PackedKvIngress(const TextRunnerDescriptor& descriptor,
+                     std::span<const cache::ComponentDescriptor> components) {
+  if (descriptor.state_abi != "qwen38-flash-next-rocm-session-v1")
+    return false;
+  // Inspect the registered append layout even without a durable fingerprint.
+  if (std::ranges::any_of(components, [](const auto& c) {
+        return c.kind == cache::ComponentKind::kAppendRows &&
+               c.layout_version == 2;
+      }))
+    return true;
+  return RotatedPackedIngress(descriptor, components);
+}
+
 class SettledSignal final : public cache::CompletionSignal {
 public:
   bool Ready() const noexcept override { return true; }
@@ -208,6 +239,121 @@ struct ComponentTextCache::Impl {
   std::size_t budget{};
   cache::ResourceCharge metadata;
 
+  // One admitted append chunk/tail at a time, no private-state or GPU staging
+  // allocation. ReadPayload verifies the complete dependency CRC before finish
+  // can validate model bytes and convert backing ownership. Drop that temporary
+  // payload before the next chunk. No live slot is restored or mutated here.
+  void PreflightDiskAppendRows(cache::DiskStore& store,
+                               cache::CheckpointId id) {
+    auto snapshot = store.Open(id);
+    if (!snapshot)
+      throw std::runtime_error("packed disk admission lost its publication");
+    const auto descriptors = resources->adapter->Components();
+    const auto& manifest = snapshot->Manifest();
+    if (manifest.components.size() != descriptors.size())
+      throw std::invalid_argument("packed disk component layout mismatch");
+    for (std::size_t i = 0; i < descriptors.size(); ++i) {
+      const auto& a = descriptors[i];
+      const auto& component = manifest.components[i];
+      const auto& b = component.descriptor;
+      if (a.id != b.id || a.kind != b.kind ||
+          a.layout_version != b.layout_version || a.row_bytes != b.row_bytes ||
+          a.rows_per_chunk != b.rows_per_chunk ||
+          a.state_bytes != b.state_bytes)
+        throw std::invalid_argument("packed disk component layout mismatch");
+      if (a.kind != cache::ComponentKind::kAppendRows)
+        continue;
+      if (a.row_bytes == 0 || a.rows_per_chunk == 0)
+        throw std::invalid_argument("packed disk row geometry mismatch");
+      cache::Rows first = 0;
+      const auto read = [&](const cache::DiskPayload& payload, bool tail) {
+        if (payload.bytes == 0 || payload.bytes % a.row_bytes != 0 ||
+            payload.bytes > std::numeric_limits<std::size_t>::max())
+          throw std::invalid_argument("packed disk row geometry mismatch");
+        const auto rows = payload.bytes / a.row_bytes;
+        if (rows > a.rows_per_chunk || first > component.position.valid_rows ||
+            rows > component.position.valid_rows - first)
+          throw std::invalid_argument("packed disk row range mismatch");
+        const auto bytes = static_cast<std::size_t>(payload.bytes);
+        const cache::PayloadRequest request{
+            a.id,
+            tail ? cache::ResourceCategory::kPrivateTail
+                 : cache::ResourceCategory::kBackingAssigned,
+            first, first + rows, bytes};
+        auto buffer = resources->allocate(request);
+        if (!buffer.finish || buffer.bytes.size() < bytes)
+          throw std::logic_error("incomplete packed disk admission buffer");
+        const auto host = std::as_writable_bytes(buffer.bytes.first(bytes));
+        (void)store.ReadPayload(
+            *snapshot, tail, payload,
+            {reinterpret_cast<std::uint8_t*>(host.data()), host.size()},
+            [](std::uint64_t, std::span<const std::uint8_t>) {});
+        // Never finish from the consume callback: final CRC/identity checks
+        // happen after its final piece. Model rejection must precede exposure.
+        auto verified = buffer.finish();
+        if (!verified.IsValid())
+          throw std::logic_error("invalid packed disk admission ownership");
+        first += rows;
+      };
+      for (const auto& payload : component.chunks)
+        read(payload, false);
+      if (component.tail)
+        read(*component.tail, true);
+      if (first != component.position.valid_rows)
+        throw std::invalid_argument("packed disk row coverage mismatch");
+    }
+  }
+
+  void PreflightPackedDisk(cache::DiskStore& store) {
+    if (!PackedKvIngress(runner->Descriptor(),
+                         resources->adapter->Components()))
+      return;
+    // Retirement invalidates Entries(); retain bounded publication identities.
+    struct Publication {
+      cache::CheckpointId id;
+      std::uint64_t epoch;
+    };
+    const auto entries = store.Entries();
+    if (entries.empty())
+      return;
+    if (entries.size() >
+        std::numeric_limits<std::size_t>::max() / sizeof(Publication))
+      throw std::length_error("packed disk admission inventory overflow");
+    auto charge = ledger.Reserve(cache::ResourceCategory::kMetadata,
+                                 entries.size() * sizeof(Publication));
+    std::vector<Publication> publications;
+    publications.reserve(entries.size());
+    for (const auto& entry : entries)
+      if (entry.Durable() && entry.Manifest().compatibility == digest)
+        publications.push_back({entry.Manifest().checkpoint, entry.Epoch()});
+    for (const auto& [id, epoch] : publications) {
+      const auto retire = [&] {
+        store.Invalidate(id, epoch);
+        const auto retired = store.TryRetire(id, epoch);
+        if (retired != cache::DiskRetireResult::kRetired &&
+            retired != cache::DiskRetireResult::kMissing)
+          throw std::runtime_error("cannot retire rejected packed checkpoint");
+      };
+      if (!store.Describe(id)) {
+        // A previous payload read may quarantine other publications sharing
+        // that dependency. Retire them too, without trying to read them again.
+        retire();
+        continue;
+      }
+      try {
+        PreflightDiskAppendRows(store, id);
+      } catch (const cache::DiskDependencyError&) {
+        // The store already quarantined every owner of the invalid file.
+        // Do not catch unrelated resource, allocation or operational failures.
+        retire();
+        Logger::Warn("cache", "event=packed_disk_dependency_rejected");
+      } catch (const std::invalid_argument&) {
+        retire();
+        Logger::Warn("cache", "event=packed_disk_semantic_rejected");
+      }
+    }
+  }
+
   Impl(std::shared_ptr<TextModelRunner> runner, std::size_t count,
        std::size_t ram, std::size_t slot_ceiling,
        const std::optional<TextRunnerDiskCacheOptions>& options,
@@ -304,6 +450,9 @@ struct ComponentTextCache::Impl {
     }
     budget = ram;
     if (options) {
+      // Validate/retire before even provisional catalog membership or index
+      // publication, not merely on the first later restore.
+      PreflightPackedDisk(*disk);
       catalog = std::make_unique<cache::DiskCatalog>(ledger, *disk, index);
       for (const auto& durable : disk->Entries()) {
         cache::ExecutionHistory::ObserveDurableId(

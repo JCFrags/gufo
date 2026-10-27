@@ -4,6 +4,10 @@
 #include <iostream>
 #include <map>
 #include <stdexcept>
+#include <string>
+
+#include "src/core/crypto/sha256.hpp"
+#include "src/models/qwen38_flash_next/engine.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace cache = gufo::cache;
@@ -23,7 +27,9 @@ qfn::Config ProductionGeometry() {
   c.hc_count = 4;
   c.vocab_size = 248320;
   c.num_kv_heads = 2;
+  c.num_heads = 24;
   c.head_dim = 256;
+  c.rotary_dim = 64;
   c.indexer_head_dim = 128;
   c.indexer_top_k = 2048;
   c.compress_ratio = 4;
@@ -103,7 +109,256 @@ void Check(bool mtp) {
   Require(layout.PrivateBytes() - no_ple_layout.PrivateBytes() == 368640,
           "PLE history inventory is incorrect");
 }
-void CheckExtendedContext(bool mtp) {
+void CheckQuantized(bool mtp) {
+  const auto c = ProductionGeometry();
+  const qfn::ContinuationLayout f16(c, mtp, 200000, 8);
+  const qfn::ContinuationLayout q8(c, mtp, 200000, 8, qfn::KvCacheType::kQ8_0);
+  Require(q8.Components().size() == f16.Components().size(),
+          "q8 changed the component inventory");
+  Require(q8.PrivateBytes() == f16.PrivateBytes(),
+          "q8 changed GDN, indexer rings or other private state");
+  std::size_t packed_components = 0;
+  for (std::size_t i = 0; i < q8.Components().size(); ++i) {
+    const auto& packed = q8.Components()[i];
+    const auto& original = f16.Components()[i];
+    Require(packed.part == original.part && packed.layer == original.layer &&
+                packed.descriptor.id == original.descriptor.id,
+            "q8 changed stable component identities");
+    const bool ordinary = packed.part == qfn::ContinuationPart::kKey ||
+                          packed.part == qfn::ContinuationPart::kValue ||
+                          packed.part == qfn::ContinuationPart::kDraftKey ||
+                          packed.part == qfn::ContinuationPart::kDraftValue;
+    if (ordinary) {
+      ++packed_components;
+      Require(packed.descriptor.row_bytes == 544 &&
+                  original.descriptor.row_bytes == 1024 &&
+                  packed.descriptor.layout_version == 2 &&
+                  original.descriptor.layout_version == 1,
+              "ordinary KV did not use sixteen canonical 34-byte blocks");
+    } else {
+      const auto& p = packed.descriptor;
+      const auto& o = original.descriptor;
+      Require(p.kind == o.kind && p.layout_version == o.layout_version &&
+                  p.row_bytes == o.row_bytes &&
+                  p.state_bytes == o.state_bytes &&
+                  p.rows_per_chunk == o.rows_per_chunk,
+              "q8 changed tokens, pooled indexer keys or private descriptors");
+    }
+  }
+  Require(packed_components == (mtp ? 26 : 24),
+          "not all trunk and MTP ordinary K/V components are packed");
+  for (const auto target :
+       {1U, 2U, 3U, 255U, 256U, 257U, 2051U, 100000U, 200000U}) {
+    for (const auto lag : {0U, 1U, 3U}) {
+      const auto draft = mtp && target > lag ? target - lag : 0;
+      const auto blocks = target / 4, draft_blocks = draft / 4;
+      Require(q8.Positions(target, draft, blocks, draft_blocks) ==
+                  f16.Positions(target, draft, blocks, draft_blocks),
+              "q8 changed target/draft/pool frontiers");
+      const std::size_t expected =
+          std::size_t{target} * 13060 + std::size_t{blocks} * 3072 +
+          std::size_t{draft} * 1088 + std::size_t{draft_blocks} * 256;
+      Require(q8.RowBytes(target, draft, blocks, draft_blocks) == expected,
+              "packed byte arithmetic lost a tail, pool or lagging draft");
+      if (mtp && !lag && target % 4 == 0)
+        Require(
+            q8.PrivateBytes() + expected == 133032096ULL + 14980ULL * target,
+            "q8 caught-up payload disagrees with the study");
+    }
+  }
+  auto bad = c;
+  bad.head_dim = 255;
+  Reject([&] {
+    qfn::ContinuationLayout layout(bad, mtp, 1000, 8, qfn::KvCacheType::kQ8_0);
+  });
+  Reject([&] {
+    qfn::ContinuationLayout layout(c, mtp, 1000, 8,
+                                   static_cast<qfn::KvCacheType>(99));
+  });
+}
+
+void CheckRotated(bool mtp) {
+  const auto c = ProductionGeometry();
+  const qfn::ContinuationLayout plain(c, mtp, 200000, 8,
+                                      qfn::KvCacheType::kQ8_0);
+  const qfn::ContinuationLayout rotated(c, mtp, 200000, 8,
+                                        qfn::KvCacheType::kQ8_0Rotated);
+  Require(plain.PrivateBytes() == rotated.PrivateBytes(),
+          "rotation changed private capacity");
+  Require(plain.Components().size() == rotated.Components().size(),
+          "rotation changed inventory");
+  for (std::size_t i = 0; i < plain.Components().size(); ++i) {
+    auto p = plain.Components()[i].descriptor;
+    const auto r = rotated.Components()[i].descriptor;
+    if (p.layout_version == 2) {
+      Require(r.layout_version == 3 && r.row_bytes == 544,
+              "rotated component is not v3");
+      p.layout_version = 3;
+    }
+    Require(p.id == r.id && p.kind == r.kind && p.row_bytes == r.row_bytes &&
+                p.rows_per_chunk == r.rows_per_chunk &&
+                p.state_bytes == r.state_bytes &&
+                p.layout_version == r.layout_version,
+            "rotation changed component geometry");
+  }
+  for (auto target : {1U, 255U, 256U, 257U, 2048U, 2051U, 100000U, 200000U}) {
+    const auto draft = mtp ? target - 1 : 0;
+    Require(plain.Positions(target, draft, target / 4, draft / 4) ==
+                    rotated.Positions(target, draft, target / 4, draft / 4) &&
+                plain.RowBytes(target, draft, target / 4, draft / 4) ==
+                    rotated.RowBytes(target, draft, target / 4, draft / 4),
+            "rotation changed frontiers/capacity");
+  }
+  for (unsigned field = 0; field < 4; ++field) {
+    auto bad = c;
+    if (field == 0)
+      bad.head_dim = 128;
+    if (field == 1)
+      bad.rotary_dim = 128;
+    if (field == 2)
+      bad.num_heads = 12;
+    if (field == 3)
+      bad.num_kv_heads = 1;
+    Reject([&] {
+      qfn::ContinuationLayout layout(bad, mtp, 1000, 8,
+                                     qfn::KvCacheType::kQ8_0Rotated);
+    });
+  }
+}
+
+void CheckIdentity() {
+  static_assert(qfn::Session::kSnapshotPayloadVersion == 19);
+  Require(qfn::ModelOptions{}.kv_cache_type == qfn::KvCacheType::kF16,
+          "model KV default is not F16");
+  for (const auto expected :
+       {qfn::KvCacheType::kF16, qfn::KvCacheType::kQ8_0}) {
+    Require(qfn::Session::IsCompatibleSnapshotPayload(
+                qfn::kKvCacheNumericsEpoch, expected, expected),
+            "current matching snapshot ABI was rejected");
+    for (const auto version : {0U, 17U, 18U, 20U, 21U})
+      Require(!qfn::Session::IsCompatibleSnapshotPayload(version, expected,
+                                                         expected),
+              "old or unknown snapshot epoch was accepted");
+    const auto other = expected == qfn::KvCacheType::kF16
+                           ? qfn::KvCacheType::kQ8_0
+                           : qfn::KvCacheType::kF16;
+    Require(!qfn::Session::IsCompatibleSnapshotPayload(
+                qfn::kKvCacheNumericsEpoch, other, expected),
+            "cross-dtype snapshot was accepted");
+    Require(!qfn::Session::IsCompatibleSnapshotPayload(
+                qfn::kKvCacheNumericsEpoch, static_cast<qfn::KvCacheType>(99),
+                expected),
+            "unknown snapshot dtype was accepted");
+  }
+  Require(!qfn::Session::IsCompatibleSnapshotPayload(
+              qfn::kKvCacheNumericsEpoch, static_cast<qfn::KvCacheType>(99),
+              static_cast<qfn::KvCacheType>(99)),
+          "matching unknown dtypes bypassed the snapshot gate");
+  const auto f16 = qfn::KvCacheCompatibilityIdentity(qfn::KvCacheType::kF16);
+  const auto q8 = qfn::KvCacheCompatibilityIdentity(qfn::KvCacheType::kQ8_0);
+  // Independent current-format byte expectations: no normalization or source
+  // extraction can hide changes to ordering, spelling, arithmetic or basis.
+  const std::string f16_storage =
+      "ordinary_kv_dtype=f16\n"
+      "ordinary_kv_scope=all-trunk-and-mtp\n"
+      "ordinary_kv_layout=row-major-f16-le-v1\n"
+      "ordinary_kv_block_elements=1\n"
+      "ordinary_kv_scale_dtype=none\n"
+      "ordinary_kv_rounding_saturation_revision=f16-rne-v1\n"
+      "ordinary_kv_reconstruction=f16-identity-v1\n";
+  const std::string q8_storage =
+      "ordinary_kv_scope=all-trunk-and-mtp\n"
+      "ordinary_kv_layout=ggml-q8_0-f16le-scale-then-i8x32-v1\n"
+      "ordinary_kv_block_elements=32\n"
+      "ordinary_kv_scale_dtype=f16\n"
+      "ordinary_kv_rounding_saturation_revision="
+      "f32-absmax-div127-roundf-away-clamp127-scale-f16-rne-v1\n"
+      "ordinary_kv_reconstruction=f16-rne-of-f32-scale-times-i8-v1\n"
+      "ordinary_kv_gpu_reconstruction_equality=ieee-values-zero-sign-"
+      "equivalent-v1\n"
+      "ordinary_kv_zero_or_f32_scale_underflow=scale0-codes0\n"
+      "ordinary_kv_f16_scale_underflow=preserve-codes-value-zero-v1\n";
+  const std::string rotation =
+      "ordinary_kv_basis=hadamard-rotated-v1\n"
+      "ordinary_kv_key_query_transform=h256-per-head\n"
+      "ordinary_kv_value_output_transform=4-contiguous-h64-per-head\n"
+      "ordinary_kv_transform_order=natural-sylvester-no-signs-no-permutation\n"
+      "ordinary_kv_normalization=first-f32-rne-h256-1/16-h64-1/8\n"
+      "ordinary_kv_butterfly=ascending-distance-f32-rne-low-u+v-high-u-v-v1\n"
+      "ordinary_kv_transform_placement=post-rms-post-rope-pre-store\n"
+      "ordinary_kv_output_inverse=after-complete-attention-before-sigmoid-"
+      "gate\n"
+      "ordinary_kv_indexer_transform=none\n"
+      "ordinary_kv_gpu_transform_equality=nonzero-bit-exact-zero-sign-"
+      "equivalent\n";
+  const std::string state =
+      "ordinary_kv_key_insertion=post-f32-rope\n"
+      "ordinary_kv_value_insertion=f32-projection\n"
+      "indexer_pool_dtype=f16\n"
+      "indexer_query_raw_dtype=f32\n"
+      "gdn_state_dtype=f32\n";
+  const std::string plain_version =
+      "numerical_kernel_epoch=19\n"
+      "numerical_build_lane=rocm-qfn-q8-wmma-v19\n";
+  const std::string rotated_version =
+      "numerical_kernel_epoch=20\n"
+      "numerical_build_lane=rocm-qfn-q8-wmma-v20\n";
+  Require(f16 == f16_storage + state + plain_version,
+          "F16 identity differs from current expected bytes");
+  Require(q8 == "ordinary_kv_dtype=q8_0\n" + q8_storage + state + plain_version,
+          "plain q8 identity differs from current expected bytes");
+  Require(qfn::KvCacheCompatibilityIdentity(qfn::KvCacheType::kQ8_0Rotated) ==
+              "ordinary_kv_dtype=q8_0-rotated\n" + q8_storage + rotation +
+                  state + rotated_version,
+          "rotated q8 identity differs from current expected bytes");
+  Require(f16 != q8 &&
+              f16.find("ordinary_kv_dtype=f16\n") != std::string::npos &&
+              q8.find("ordinary_kv_dtype=q8_0\n") != std::string::npos,
+          "numeric identity does not distinguish storage dtypes");
+  for (const auto* identity : {&f16, &q8}) {
+    for (const auto field :
+         {"ordinary_kv_layout=", "ordinary_kv_block_elements=",
+          "ordinary_kv_scale_dtype=",
+          "ordinary_kv_rounding_saturation_revision=",
+          "ordinary_kv_reconstruction=",
+          "ordinary_kv_key_insertion=post-f32-rope\n",
+          "indexer_pool_dtype=f16\n", "gdn_state_dtype=f32\n",
+          "numerical_kernel_epoch=19\n", "numerical_build_lane="})
+      Require(identity->find(field) != std::string::npos,
+              "numeric identity omitted a storage/arithmetic contract");
+  }
+  Require(q8.find("roundf-away-clamp127-scale-f16-rne-v1") != std::string::npos,
+          "q8 identity omitted canonical rounding and saturation");
+  const std::string equality =
+      "ordinary_kv_gpu_reconstruction_equality=ieee-values-zero-sign-"
+      "equivalent-v1\n";
+  const std::string underflow =
+      "ordinary_kv_f16_scale_underflow=preserve-codes-value-zero-v1\n";
+  Require(q8.find(equality) != std::string::npos &&
+              q8.find(underflow) != std::string::npos &&
+              q8.find("preserve-codes-signed-zero-v1") == std::string::npos &&
+              f16.find("ordinary_kv_gpu_reconstruction_equality=") ==
+                  std::string::npos,
+          "GPU value equality contract is missing or changed F16 identity");
+  // Correcting the old zero-sign promise changes the q8 identity input to
+  // component/disk fingerprints even without an epoch change. Never alias it.
+  auto legacy_q8 = q8;
+  legacy_q8.erase(legacy_q8.find(equality), equality.size());
+  legacy_q8.replace(legacy_q8.find(underflow), underflow.size(),
+                    "ordinary_kv_f16_scale_underflow="
+                    "preserve-codes-signed-zero-v1\n");
+  const auto fingerprint = [](const std::string& value) {
+    return gufo::crypto::Sha256Hex(
+        {reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
+  };
+  Require(fingerprint(q8) != fingerprint(legacy_q8),
+          "corrected q8 contract did not change its numeric fingerprint");
+  Reject([&] {
+    (void)qfn::KvCacheCompatibilityIdentity(static_cast<qfn::KvCacheType>(99));
+  });
+}
+
+void CheckExtendedContext(bool mtp, qfn::KvCacheType type) {
   const auto native = ProductionGeometry();
   Reject([&] {
     qfn::ContinuationLayout layout(native, mtp, native.context_length + 1, 8);
@@ -112,7 +367,7 @@ void CheckExtendedContext(bool mtp) {
     auto scaled = native;
     scaled.rope_scaling = {.factor = context == 409600 ? 1.5625F : 2.5F,
                            .original_context = 262144};
-    const qfn::ContinuationLayout layout(scaled, mtp, context, 8);
+    const qfn::ContinuationLayout layout(scaled, mtp, context, 8, type);
     Require(scaled.context_length == 262144,
             "continuation scaling rewrote the native context");
     Require(layout.Components().size() == (mtp ? 130 : 124),
@@ -121,11 +376,14 @@ void CheckExtendedContext(bool mtp) {
             "extended context inflated the bounded raw ring");
     for (const auto target : {262145U, context}) {
       const auto draft = mtp ? target - 1 : 0;
-      // Twelve layers of 2048 KV bytes per token and 256 pooled bytes per
-      // complete four-token block, plus four history bytes per token.
+      // Twelve pairs of canonical KV rows plus unchanged pool/token bytes.
+      const std::size_t pair_bytes =
+          type == qfn::KvCacheType::kF16 ? 2048 : 1088;
       const auto expected =
-          std::size_t{target} * 24580 + std::size_t{target / 4} * 3072 +
-          (mtp ? std::size_t{draft} * 2048 + std::size_t{draft / 4} * 256 : 0);
+          std::size_t{target} * (12 * pair_bytes + 4) +
+          std::size_t{target / 4} * 3072 +
+          (mtp ? std::size_t{draft} * pair_bytes + std::size_t{draft / 4} * 256
+               : 0);
       Require(layout.RowBytes(target, draft, target / 4, draft / 4) == expected,
               "extended frontier lost target or predictor rows");
     }
@@ -137,9 +395,9 @@ void CheckExtendedContext(bool mtp) {
 }
 void CheckBacking(bool mtp, std::uint32_t context, std::uint32_t concurrency,
                   std::size_t ram, std::size_t checkpoints,
-                  std::size_t independent_rows) {
+                  std::size_t independent_rows, qfn::KvCacheType type) {
   const auto c = ProductionGeometry();
-  const qfn::ContinuationLayout layout(c, mtp, context, 8);
+  const qfn::ContinuationLayout layout(c, mtp, context, 8, type);
   std::size_t available = 0, required = 0;
   std::size_t bytes = 0;
   for (const auto& allocation : layout.BackingPlan(ram, concurrency)) {
@@ -189,12 +447,18 @@ int main() {
   try {
     Check(false);
     Check(true);
+    CheckIdentity();
     for (const auto mtp : {false, true}) {
-      CheckExtendedContext(mtp);
-      CheckBacking(mtp, 32768, 2, 8ULL << 30, 32, 2 * 32768);
-      CheckBacking(mtp, 32768, 2, 2ULL << 30, 8, 2 * 4096);
-      CheckBacking(mtp, 4096, 8, 8ULL << 30, 8, 8 * 4096);
-      CheckBacking(mtp, 133760, 1, 8ULL << 30, 8, 2 * 100000);
+      CheckQuantized(mtp);
+      CheckRotated(mtp);
+      for (const auto type :
+           {qfn::KvCacheType::kF16, qfn::KvCacheType::kQ8_0}) {
+        CheckExtendedContext(mtp, type);
+        CheckBacking(mtp, 32768, 2, 8ULL << 30, 32, 2 * 32768, type);
+        CheckBacking(mtp, 32768, 2, 2ULL << 30, 8, 2 * 4096, type);
+        CheckBacking(mtp, 4096, 8, 8ULL << 30, 8, 8 * 4096, type);
+        CheckBacking(mtp, 133760, 1, 8ULL << 30, 8, 2 * 100000, type);
+      }
     }
     const auto c = ProductionGeometry();
     Reject([&] { qfn::ContinuationLayout layout(c, false, 0, 8); });

@@ -10,9 +10,11 @@
 #include <string_view>
 #include <vector>
 
+#include "src/cli/serve/qfn_kv_ingress_validation.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
+#include "src/models/qwen38_flash_next/kv_cache.hpp"
 
 namespace gufo::hip {
 class QwenGpuModel;
@@ -84,7 +86,9 @@ public:
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
             TextRunnerRamCacheOptions ram_cache_config = {},
-            bool enable_yarn = false);
+            bool enable_yarn = false,
+            models::qwen38_flash_next::KvCacheType kv_cache_type =
+                models::qwen38_flash_next::KvCacheType::kF16);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.

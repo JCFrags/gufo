@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -13,6 +14,7 @@
 
 #include "src/cache/slot.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "tests/models/qwen38_flash_next/kv_rotation_restore_test_support.hpp"
 #include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
@@ -863,6 +865,207 @@ void CheckImages(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   }
   std::cout << (mtp ? "MTP" : "AR") << ",image_restore,PASS\n";
 }
+namespace kr = gufo::test::kv_rotation_restore;
+std::vector<std::byte> ReadDevice(std::span<const std::byte> view) {
+  std::vector<std::byte> bytes(view.size());
+  Require(hipMemcpy(bytes.data(), view.data(), view.size(),
+                    hipMemcpyDeviceToHost) == hipSuccess,
+          "read borrowed fault-fixture rows failed");
+  return bytes;
+}
+// Patch ACTUAL borrowed device rows only while no execution/capture can use
+// the source. Restore even on assertion failure; a cleanup failure is fatal.
+struct BorrowedPatch {
+  std::span<const std::byte> view;
+  std::vector<std::byte> original;
+  explicit BorrowedPatch(std::span<const std::byte> bytes)
+      : view(bytes), original(ReadDevice(bytes)) {}
+  void Put(std::span<const std::byte> bad) {
+    Require(bad.size() == view.size(), "borrowed patch size");
+    Require(hipMemcpy(const_cast<std::byte*>(view.data()), bad.data(),
+                      bad.size(), hipMemcpyHostToDevice) == hipSuccess,
+            "patch borrowed rows failed");
+  }
+  ~BorrowedPatch() {
+    if (hipMemcpy(const_cast<std::byte*>(view.data()), original.data(),
+                  original.size(), hipMemcpyHostToDevice) != hipSuccess) {
+      std::cerr << "fatal: restoring test-only borrowed KV patch failed\n";
+      std::abort();
+    }
+  }
+};
+void CheckRotatedPayloads(const std::shared_ptr<qfn::Model>& model, bool mtp) {
+  Require(model->CacheType() == qfn::KvCacheType::kQ8_0Rotated,
+          "rotated payload fixture requires q8_0-rotated");
+  constexpr std::uint32_t context = 256;
+  gufo::hip::TransferPool streams(2);
+  const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive;
+  qfn::ContinuationAdapter adapter(model, mode, context,
+                                   {'r', 'o', 't', '2', '3'});
+  Guard ga, gb;
+  auto source = adapter.CreateSlot(ga), destination = adapter.CreateSlot(gb);
+  auto& live = adapter.GetSession(*source);
+  auto& restored = adapter.GetSession(*destination);
+  const auto pattern = model->Tokenize(
+      "List red, green, blue, yellow, black, white, orange and violet. "
+      "Then give each color a different integer and a short explanation.");
+  Require(!pattern.empty(), "empty KV fault pattern");
+  std::vector<std::int32_t> prompt(160);
+  for (std::size_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = pattern[i % pattern.size()];
+  std::string error;
+  Require(live.Sync(prompt, &error), error);
+  (void)Decode(live, 8);
+  if (mtp)
+    Require(live.Statistics().drafted != 0,
+            "draft KV fault fixture did not execute MTP");
+  const auto checkpoint = Capture(adapter, *source, streams);
+  const auto good = kr::Payload(live);
+  const auto headers = kr::ReadHeaders(good, *model);
+  Load(adapter, *destination, checkpoint, streams);
+  Require(adapter.Validate(*destination, checkpoint.positions),
+          "valid KV fixture load failed");
+  Require(kr::Payload(restored) == good,
+          "component/native valid fixture mismatch");
+  // kept_rows only sizes a non-KV private component; use real layout part/ID
+  // metadata to classify rows, and match every selected descriptor to adapter.
+  qfn::ContinuationLayout layout(model->config(), mtp, context, 1,
+                                 model->CacheType());
+  Require(layout.Components().size() == adapter.Components().size() &&
+              checkpoint.bytes.size() == adapter.Components().size(),
+          "fault fixture component inventory mismatch");
+  unsigned covered = 0;
+  for (std::size_t i = 0; i < layout.Components().size(); ++i) {
+    const auto& entry = layout.Components()[i];
+    const auto part = entry.part;
+    const unsigned bit = part == qfn::ContinuationPart::kKey          ? 1U
+                         : part == qfn::ContinuationPart::kValue      ? 2U
+                         : part == qfn::ContinuationPart::kDraftKey   ? 4U
+                         : part == qfn::ContinuationPart::kDraftValue ? 8U
+                                                                      : 0U;
+    if (!bit || (covered & bit))
+      continue;  // one ordinary attention layer's K/V, plus draft K/V
+    const auto& descriptor = adapter.Components()[i];
+    Require(descriptor.id == entry.descriptor.id &&
+                descriptor.layout_version == 3 &&
+                descriptor.row_bytes == entry.descriptor.row_bytes,
+            "rotated component descriptor/identity mismatch");
+    const auto row = descriptor.row_bytes;
+    const auto rows = checkpoint.positions[i].valid_rows;
+    // Cross ValidatePackedRows' bounded 64-KiB staging boundary. A bad tail
+    // must prevent copying even an earlier, fully valid staging chunk.
+    Require(row != 0 && row <= 65536, "unexpected pinned KV row size");
+    const cache::Rows piece_rows = 65536 / row + 2;
+    Require(rows >= piece_rows && checkpoint.bytes[i].size() == rows * row,
+            "ordinary/draft fault fixture lacks multi-stage captured rows");
+    const auto first = rows - piece_rows;
+    const auto offset = first * row;
+    const auto captured = std::span<const std::byte>(checkpoint.bytes[i]);
+    const auto frame_offset = kr::UniqueRegion(good, captured);
+    Require(frame_offset >= headers.native_offset &&
+                captured.size() <= good.size() - frame_offset,
+            "KV region outside captured native payload");
+    auto piece =
+        std::vector<std::byte>(captured.begin() + offset, captured.end());
+    // Make the first VALID row differ from destination. An implementation
+    // that copies it before finding the malformed final block must be caught.
+    bool changed = false;
+    for (cache::Rows r = 0; r < rows && !changed; ++r) {
+      const auto candidate = captured.subspan(r * row, row);
+      if (!std::equal(candidate.begin(), candidate.end(), piece.begin())) {
+        std::copy(candidate.begin(), candidate.end(), piece.begin());
+        changed = true;
+      }
+    }
+    Require(changed, "captured rows cannot expose an early partial copy");
+    qfn::ValidateKvRow(std::span(piece).first(row),
+                       model->config().AttentionKvDim(), model->CacheType());
+    for (auto fault : kr::kFaults) {
+      auto bad = piece;
+      kr::CorruptLastBlock(bad, fault);
+      std::string codec_error;
+      try {
+        qfn::ValidateKvRow(std::span(bad).last(row),
+                           model->config().AttentionKvDim(),
+                           model->CacheType());
+      } catch (const std::invalid_argument& e) {
+        codec_error = e.what();
+      }
+      Require(!codec_error.empty(),
+              "malformed packed fixture passed CPU validation");
+      auto bad_frame = good;
+      std::memcpy(bad_frame.data() + frame_offset + offset, bad.data(),
+                  bad.size());
+      // Real public framing reaches native packed-row preflight, not a
+      // fabricated executor header. Match its actual codec rejection reason.
+      kr::RejectWithoutMutation(restored, bad_frame, good, codec_error);
+      for (bool device : {false, true}) {
+        const auto destination_view =
+            adapter.BorrowRowsView(*destination, descriptor.id, first, rows);
+        const auto before = ReadDevice(destination_view);
+        const auto source_view =
+            adapter.BorrowRowsView(*source, descriptor.id, first, rows);
+        hipPointerAttribute_t attributes{};
+        Require(hipPointerGetAttributes(&attributes, source_view.data()) ==
+                        hipSuccess &&
+                    attributes.type == hipMemoryTypeDevice,
+                "borrowed fixture did not name real device memory");
+        adapter.BeginRestore(*destination, checkpoint.positions);
+        Require(!destination->IsValid(),
+                "restore phase exposed executable state");
+        auto stream = streams.TryAcquire();
+        Require(bool(stream), "KV fault stream exhausted");
+        const auto attempt = [&](std::span<const std::byte> input) {
+          bool rejected = false;
+          try {
+            Wait(adapter.CopyRowsIn(*destination, descriptor.id, first, rows,
+                                    input, *stream));
+          } catch (const std::invalid_argument& e) {
+            Require(codec_error == e.what(),
+                    "CopyRowsIn refused for a non-codec reason");
+            rejected = true;
+          }
+          Require(rejected, "CopyRowsIn accepted malformed rotated rows");
+        };
+        if (device) {
+          BorrowedPatch patch(source_view);
+          patch.Put(bad);
+          attempt(source_view);
+        } else {
+          attempt(bad);
+        }
+        Require(stream->Synchronize() == cache::TransferResult::kSucceeded,
+                "rejected row-copy stream failed");
+        Require(ReadDevice(destination_view) == before,
+                "malformed piece copied a valid prefix or changed destination "
+                "rows");
+        Require(!destination->IsValid() &&
+                    !adapter.Validate(*destination, checkpoint.positions),
+                "failed packed restore became executable");
+        Reject([&] { (void)adapter.GetSession(*destination); });
+        stream.reset();
+        // BeginRestore intentionally invalidates first; recovery is through
+        // the real adapter Invalidate/reset contract, not rollback of it.
+        Require(adapter.Invalidate(*destination),
+                "failed packed restore reset failed");
+        Load(adapter, *destination, checkpoint, streams);
+        Require(adapter.Validate(*destination, checkpoint.positions),
+                "valid restore after packed rejection failed");
+        Require(
+            Capture(adapter, *destination, streams).bytes == checkpoint.bytes,
+            "valid restore after packed rejection changed component bytes");
+      }
+    }
+    covered |= bit;
+  }
+  Require(covered == (mtp ? 15U : 3U),
+          "ordinary/draft KV fault coverage incomplete");
+  std::cout << "ROTATED_KV_V3_RESTORE: " << (mtp ? "MTP" : "AR")
+            << " public/native-payload, host/device-borrowed CopyRowsIn; "
+               "six codec faults per K/V part, preflight and recovery exact\n";
+}
+
 void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
   namespace qt = gufo::tokenization;
   gufo::hip::TransferPool streams(2);
@@ -903,6 +1106,21 @@ void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
 }
 }  // namespace
 int main(int argc, char** argv) {
+  auto cache_type = qfn::KvCacheType::kF16;
+  if (argc >= 3 && std::string_view(argv[argc - 2]) == "--kv-cache-type") {
+    const std::string_view value(argv[argc - 1]);
+    if (value == "q8_0")
+      cache_type = qfn::KvCacheType::kQ8_0;
+    else if (value == "q8_0-rotated")
+      cache_type = qfn::KvCacheType::kQ8_0Rotated;
+    else if (value != "f16") {
+      std::cerr << "--kv-cache-type requires f16 or q8_0"
+                   " or q8_0-rotated"
+                   "\n";
+      return 2;
+    }
+    argc -= 2;
+  }
   const bool guard_only =
       argc == 6 && std::string_view(argv[5]) == "--guard-only";
   const bool image_only =
@@ -913,21 +1131,48 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--policy-only";
   const bool reuse_only =
       argc == 6 && std::string_view(argv[5]) == "--reuse-only";
+  const bool kv_payload_only =
+      argc == 6 && std::string_view(argv[5]) == "--kv-payload-only";
+  if (kv_payload_only && cache_type != qfn::KvCacheType::kQ8_0Rotated) {
+    std::cerr << "--kv-payload-only requires --kv-cache-type q8_0-rotated\n";
+    return 2;
+  }
   if ((argc != 5 && !guard_only && !image_only && !in_pass_only &&
-       !policy_only && !reuse_only) ||
+       !policy_only && !reuse_only && !kv_payload_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: continuation_adapter_test --model FIRST.gguf "
                  "--mtp-model MTP.gguf "
                  "[--guard-only|--image-only|--in-pass-only|--policy-only|"
-                 "--reuse-only]\n";
+                 "--reuse-only"
+                 "|--kv-payload-only"
+                 "] "
+                 "[--kv-cache-type f16|q8_0"
+                 "|q8_0-rotated"
+                 "]\n";
     return 77;
   }
   try {
     std::string error;
-    auto model = qfn::Model::Load(
-        argv[2], {.max_context = 16384, .mtp_model_path = argv[4]}, &error);
+    auto model = qfn::Model::Load(argv[2],
+                                  {.max_context = 16384,
+                                   .mtp_model_path = argv[4],
+                                   .kv_cache_type = cache_type},
+                                  &error);
     Require(bool(model), error);
+    Require(model->CacheType() == cache_type, "selected model cache type lost");
+    if (kv_payload_only ||
+        (cache_type == qfn::KvCacheType::kQ8_0Rotated && !guard_only &&
+         !image_only && !in_pass_only && !policy_only && !reuse_only)) {
+      CheckRotatedPayloads(model, false);
+      if (model->HasMtp())
+        CheckRotatedPayloads(model, true);
+      else
+        std::cout << "ROTATED_KV_V3_RESTORE: draft components NOT TESTED; "
+                     "model has no MTP\n";
+      if (kv_payload_only)
+        return 0;
+    }
     if (policy_only) {
       CheckLearnedDraftPolicy(model);
       return 0;

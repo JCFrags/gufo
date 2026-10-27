@@ -1,5 +1,61 @@
 # Qwen3.8 Flash-Next quality
 
+## Q8 KV distribution reference, October 27, 2026
+
+Version-18 disk entries are not reused; F16/plain q8 use version 19 and rotated q8 uses version 20.
+
+Historical development-branch measurements on gfx1151 used the same
+UD-Q4_K_XL weights and 144 frozen rows from 18 histories. Each arm is compared
+with its own engine's F16 reference: full-vocabulary logits (248320 entries),
+F64 scoring of `KL(F16 || q8)` in nats, linear-interpolated p99 and argmax
+agreement, not sampled-token agreement.
+
+| Engine / KV mode | Capture | Mean KL | p99 KL | Max KL | Top-1 agreement |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Gufo plain q8 | Cold prefixes | 0.00137127 | 0.0309366 | 0.0825341 | 141/144 |
+| Gufo rotated q8 | Cold prefixes | 0.000946485 | 0.0175448 | 0.0377823 | 141/144 |
+| llama.cpp plain q8 | History-streamed | 0.0132854 | 0.0359624 | 1.79347 | 141/144 |
+| llama.cpp default rotated q8 | History-streamed | 0.00643116 | 0.0511198 | 0.734231 | 141/144 |
+
+Gufo's historical source was `f2ae34244b939ee7611c9c17612a035a75533450`;
+llama.cpp used
+[`338fce6511c744893cc0d3d958b275f40552c7a4`](https://github.com/ggml-org/llama.cpp/tree/338fce6511c744893cc0d3d958b275f40552c7a4).
+Gufo independently re-prefilled each cold prefix; llama.cpp teacher-forced
+each history once, clearing state between histories and feeding no generated
+tokens back. Streamed and cold numerical equivalence is not established.
+llama.cpp also quantizes indexer K; Gufo retains F16 indexer state. The engines'
+F16 distributions differ. These are distribution references for context,
+**not a strictly matched test or a non-inferiority claim**.
+
+The original internal strict quality gates were not met; their verdicts remain
+unchanged. Equal aggregate top-1 agreement does not imply identical error rows
+or downstream task quality.
+
+The same 144-row BF16-key/block16 diagnostic screen gave:
+
+| Arm versus F16 | Mean KL | p99 / max KL | Top-1 losses | ΔNLL, nats |
+| --- | ---: | ---: | ---: | ---: |
+| Plain block32 q8 | 0.00137127 | 0.0309366 / 0.0825341 | 3/144 | −0.0002244 |
+| BF16-rounded K, V F16 | 0.00179624 | 0.0441063 / 0.117239 | 3/144 | −0.0101736 |
+| Block16 q8 diagnostic | 0.00352501 | 0.0666951 / 0.186887 | 2/144 | −0.0058822 |
+
+Plain q8 is at the BF16-key KL precision-control level on this screen, not a
+proven universal noise floor: paired BF16-K minus plain mean-KL 95% CI
+[−0.000646, +0.001965] is inconclusive. Block16 costs 5.9% more ordinary-KV
+bytes and has worse mean KL, paired CI [+0.000372, +0.004288], despite one
+fewer top-1 loss. It is not included in the implementation. Intervals use
+5000 paired whole-history bootstrap resamples, not simultaneous tail bounds.
+Historical F16/plain captures were reused after eight byte-exact spotchecks
+per arm; fresh diagnostic captures do not establish full new-build equivalence.
+Residual source/epoch confounding remains outside those intervals.
+
+This implementation has not yet had final native/model validation: historical
+quality and development-branch packed-load operator/serving evidence do not
+qualify it. F16 remains the runtime default;
+`--kv-cache-type` explicitly selects either q8 mode. See
+[KV cache formats](KV-CACHE.md) for the codec, transient prefill
+view, memory costs and compatibility contracts.
+
 ## Sampled draft-head costs, October 23, 2026
 
 Based on main `41d93463`, including the expanded greedy-head eligibility.
