@@ -13,11 +13,27 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kv_q8_prefill_view.hpp"
+#include "tests/models/qwen38_flash_next/checkpoint_memory_test_support.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 using qfn::KvCacheType;
 
 namespace {
+void CheckCheckpointMemoryBound() {
+  using gufo::test::QfnDeepCheckpointMinimumBytes;
+  constexpr std::uint64_t f16_minimum = 80ULL << 20;
+  static_assert(QfnDeepCheckpointMinimumBytes(512, KvCacheType::kF16) ==
+                f16_minimum);
+  static_assert(QfnDeepCheckpointMinimumBytes(512, KvCacheType::kQ8_0) ==
+                f16_minimum * 544 / 1024);
+  static_assert(QfnDeepCheckpointMinimumBytes(512, KvCacheType::kQ8_0Rotated) ==
+                f16_minimum * 544 / 1024);
+  static_assert(QfnDeepCheckpointMinimumBytes(256, KvCacheType::kF16) ==
+                f16_minimum);
+  static_assert(QfnDeepCheckpointMinimumBytes(1024, KvCacheType::kQ8_0) ==
+                f16_minimum * 1088 / 2048);
+}
+
 void CheckPrefillViewPolicy() {
   using qfn::rocm::detail::Q8PrefillViewCapacity;
   using qfn::rocm::detail::Q8PrefillViewFits;
@@ -642,6 +658,7 @@ void CheckInvalidBuffers() {
 
 int main() {
   try {
+    CheckCheckpointMemoryBound();
     CheckPrefillViewPolicy();
     CheckLayout();
     CheckHalfConversions();

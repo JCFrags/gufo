@@ -13,6 +13,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "tests/models/qwen38_flash_next/checkpoint_memory_test_support.hpp"
 #include "tests/models/qwen38_flash_next/kv_rotation_restore_test_support.hpp"
 
 void LimitReportedDeviceFree(std::size_t bytes);
@@ -293,7 +294,9 @@ void CheckCheckpointRetention(const std::shared_ptr<qfn::Model>& model,
   Require(large != nullptr, error);
   source->Reset();
   Require(source->Sync(prompt.first(16), &error), error);
-  Require(large->DeviceBytes() > before + (80ULL << 20),
+  const auto deep_minimum = gufo::test::QfnDeepCheckpointMinimumBytes(
+      model->config().AttentionKvDim(), model->CacheType());
+  Require(large->DeviceBytes() > before + deep_minimum,
           "deep checkpoint did not preserve its overwritten rows");
   large.reset();
   // Count owned backing blocks rather than HIP's global heap cache. A short
