@@ -441,6 +441,34 @@ class FunctionalRunnerTest(unittest.TestCase):
             with self.subTest(label), self.assertRaises(ValueError):
                 check_disk_spacing(grown_log, restored_log, report)
 
+    def test_pressure_retry_accepts_only_capacity_refusal_ledger_witnesses(self):
+        from cache_growth import check_unchanged_retry, retry_copy_refused
+        retry = {"usage": {"prompt_tokens": 1346}}
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            for reason in (1, 2):
+                for suffix in ("", " bytes=4096\n"):
+                    log.write_text("schema=component-cache-v1 event=retention "
+                                   f"action=1 reason={reason} tokens=1346{suffix}")
+                    end = log.stat().st_size
+                    self.assertTrue(retry_copy_refused(log, 0, end, 1346))
+                    check_unchanged_retry("ledger", retry, 16, log, 0, end)
+                    with self.assertRaises(AssertionError):
+                        check_unchanged_retry("ledger", retry, 17, log, 0, end)
+                    self.assertFalse(retry_copy_refused(log, end, end, 1346))
+            for event in (
+                "event=retention action=0 reason=1 tokens=1346",
+                "event=retention action=1 reason=3 tokens=1346",
+                "event=retention action=1 reason=12 tokens=1346",
+                "event=retention action=1 reason=2 tokens=13460",
+                "event=retention action=1 reason=2 tokens=1345",
+                "event=capture_failed action=1 reason=2 tokens=1346",
+            ):
+                with self.subTest(event=event):
+                    log.write_text("schema=component-cache-v1 " + event + "\n")
+                    self.assertFalse(retry_copy_refused(
+                        log, 0, log.stat().st_size, 1346))
+
     def test_pressure_retry_respects_the_counted_mutable_user_suffix(self):
         from cache_growth import check_unchanged_retry
         retry = {"usage": {"prompt_tokens": 1346}}

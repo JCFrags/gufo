@@ -25,7 +25,10 @@ def retry_copy_refused(server_log, start, end, prompt_tokens):
                        rf"bytes=\d+ tokens={prompt_tokens} ", window)
     component = re.search(r"schema=component-cache-v1 event=capture_refused "
                           rf"reason=(?:byte|entry)_capacity tokens={prompt_tokens}(?:\s|$)", window)
-    return legacy is not None or component is not None
+    # RetentionAction::kRefused=1; RetentionReason::kByteCapacity/kRecordCapacity=1/2.
+    retention = re.search(r"schema=component-cache-v1 event=retention action=1 "
+                          rf"reason=(?:1|2) tokens={prompt_tokens}(?:\s|$)", window)
+    return legacy is not None or component is not None or retention is not None
 
 
 def check_unchanged_retry(label, retry, prefilled, server_log, start, end, *,
