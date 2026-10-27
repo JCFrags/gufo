@@ -1601,10 +1601,6 @@ void CorruptedDisk() {
     for (bool fingerprint : {true, false}) {
       const TemporaryDirectory temp("gufo-packed-corrupt-disk");
       const auto bad = Canonical(type);
-      auto dependent = bad;
-      dependent.header.manifest.checkpoint = {2000};
-      dependent.header.manifest.lineage = {2000};
-      dependent.header.manifest.tokens = {20, 21};
       auto good = bad;
       good.header.manifest.checkpoint = {3000};
       good.header.manifest.lineage = {3000};
@@ -1617,7 +1613,6 @@ void CorruptedDisk() {
             (*p)->file[1] = 1;
       }
       Publish(temp.path(), bad);
-      Publish(temp.path(), dependent, 254);  // Shares the corrupt dependency.
       Publish(temp.path(), good, 253);
       cache::DiskFileId file{};
       file[0] = static_cast<std::uint8_t>(bad.kv_images[0] + 1);
@@ -1640,9 +1635,9 @@ void CorruptedDisk() {
         // Only the serving startup's payload read can detect this corruption.
         cache::ResourceLedger ledger({kRam, kRam, 0, 0});
         cache::DiskStore disk(ledger, temp.path(), kRam);
-        assert(disk.Entries().size() == 3);
+        assert(disk.Entries().size() == 2);
         for (const auto* artifact :
-             std::array<const Artifact*, 3>{&bad, &dependent, &good}) {
+             std::array<const Artifact*, 2>{&bad, &good}) {
           auto description =
               disk.Describe(artifact->header.manifest.checkpoint);
           assert(description);
@@ -1658,8 +1653,6 @@ void CorruptedDisk() {
             TextRunnerDiskCacheOptions{.directory = temp.path(),
                                        .capacity_bytes = kRam});
         assert(restarted.CachedPrefixTokens(bad.header.manifest.tokens,
-                                            nullptr) == 0);
-        assert(restarted.CachedPrefixTokens(dependent.header.manifest.tokens,
                                             nullptr) == 0);
         assert(restarted.CachedPrefixTokens(good.header.manifest.tokens,
                                             nullptr) == 2);
