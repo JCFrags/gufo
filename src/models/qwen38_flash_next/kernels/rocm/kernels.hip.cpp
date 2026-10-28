@@ -3167,18 +3167,23 @@ __global__ void AttentionKernel(const float* q, const void* k_cache,
       static_assert(kBatch == 8);
       std::uint64_t raw_codes[kBatch];
       std::uint32_t raw_scales[kBatch];
+      // The launcher requires D256: each row/head is block-aligned. Factor
+      // its byte stride once instead of dividing/scaling every row index.
+      constexpr std::size_t kRowBlockElements = kKvQ8BlockElements;
+      const std::size_t column = head_offset + lane * 8;
+      const std::size_t row_bytes =
+          (kv_stride / kRowBlockElements) * sizeof(Q8KvDeviceBlock);
+      const auto* column_block =
+          static_cast<const unsigned char*>(head) +
+          (column / kRowBlockElements) * sizeof(Q8KvDeviceBlock);
+      const std::size_t code_offset = 2 + column % kRowBlockElements;
 #pragma unroll
       for (std::uint32_t b = 0; b < kBatch; ++b) {
         const std::uint32_t j = min(keys[base + b], n_kv - 1);
-        const std::size_t index = head_offset +
-                                  (static_cast<std::size_t>(j) * kv_stride) +
-                                  (lane * 8);
-        const auto* block =
-            static_cast<const unsigned char*>(head) +
-            (index / kKvQ8BlockElements) * sizeof(Q8KvDeviceBlock);
+        const auto* block = column_block + std::size_t{j} * row_bytes;
         std::uint16_t scale_bits;
         __builtin_memcpy(&scale_bits, block, sizeof(scale_bits));
-        __builtin_memcpy(&raw_codes[b], block + 2 + index % kKvQ8BlockElements,
+        __builtin_memcpy(&raw_codes[b], block + code_offset,
                          sizeof(raw_codes[b]));
         raw_scales[b] = scale_bits;
       }
