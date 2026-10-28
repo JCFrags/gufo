@@ -63,3 +63,15 @@ The [capacity experiment](memory.md) predates the transient view. Four requests 
 The short output rates include prefill/queueing. C1 used three quick prompts once each; C4 padded them to four. Different outputs and MTP acceptance affect interpretation; this was one ordered pair.
 
 The four smaller view-enabled cells **do not demonstrate 200K recovery**. Rotated performance, sustained reuse/decode and final-R3 serving performance remain unestablished here. Synchronous CPU row-validation cost at cache-hit depth is unmeasured. Historical ROCm 7.2.4 / Clang 22 results do not qualify pinned **ROCm 10.1 / HIP Clang 24, which is UNTESTED for this change**.
+
+## Fork-only decode verification speedups (2026-10-28)
+
+Fork main carries two exact, output-preserving kernel changes that are **not part of the upstream q8 PR**: block-aligned q8 row-address factoring, and a lower Group4 prefetch depth. The Group4 change cuts it from 163 to 138 VGPRs, which fits the gfx1151 24-register allocation granule one wave higher. Matched model-free kernel timing against the PR code on gfx1151:
+
+| MTP verify kernel | Before (µs) | After (µs) | Change |
+| --- | ---: | ---: | ---: |
+| Group2, n1 | 31.819 | 29.239 | −8.1% |
+| Group4, n4 | 90.597 | 67.998 | −24.9% |
+| Group4, n8 | 149.635 | 128.556 | −14.1% |
+
+The q8 operator tests (including the exhaustive dequantization check), the F16/plain/rotated MTP greedy hashes and the 32K draft/acceptance counts are identical to the PR code. These are kernel timings; an 8K serving screen of the same changes on the development branch showed no measurable end-to-end difference.

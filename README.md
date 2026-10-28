@@ -21,7 +21,7 @@ Both modes are always compiled into the normal HIP build. Eligible plain-q8 matr
 
 - **Memory:** a 512-value K or V row shrinks from 1024 to 544 bytes, not a halving of total RAM. View scratch is shared per executor: 390.625 MiB at context 200000, capped at 512 MiB for supported geometry. See [memory and capacity data](docs/q8-kv-cache/memory.md).
 - **Historical capacity:** an earlier view-enabled build completed four 376832-token slots and one 1048576-token slot with YaRN and LIVE follow-up turns. These are not fresh R3, task-quality or evicted-checkpoint results; see the [measured limits](docs/q8-kv-cache/memory.md).
-- **Historical speed:** plain-q8 prefill with the view ranged −0.57% to +3.57% versus same-binary F16 across four 8K/32K cells. Decode was about 1% behind at 32K, preliminarily. These are not final-R3 performance measurements.
+- **Historical speed:** plain-q8 prefill with the view ranged −0.57% to +3.57% versus same-binary F16 across four 8K/32K cells. Decode was about 1% behind at 32K, preliminarily. These are not final-R3 performance measurements. Fork main additionally carries exact MTP-verify kernel speedups (Group4 −14% at n8); see [speed](docs/q8-kv-cache/speed.md#fork-only-decode-verification-speedups-2026-10-28).
 - **Historical quality:** a 144-position / 18-history screen gave mean KL 0.00137127 plain / 0.000946485 rotated, with 141/144 top-1 agreement each versus F16. Rotation raised target NLL; it is not uniformly better.
 
 **Upgrade:** version-18 Flash-Next caches, including F16, rebuild once. Current payloads are 19 for F16/plain q8 and 20 for rotated q8; both q8 modes support disk persistence. Incompatible type/epoch identities are rejected.
